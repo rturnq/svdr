@@ -17,6 +17,8 @@ export interface Options {
   /** Serve plain HTTP instead of HTTPS with a self-signed certificate. */
   http: boolean;
   prod: boolean;
+  /** Reload pages, or swap their stylesheets, when what they show changes. */
+  hot: boolean;
 }
 
 export const usage = `Usage: svdr [options]
@@ -29,9 +31,11 @@ Options:
   -x, --extensions <list>   Comma separated extensions to try for paths without
                             one and for directory indexes, in order of
                             preference, or "none" (default: marko,html)
+  -h, --hot [on|off]        Reload pages and swap their styles when files change
+                            (default: on, or off with --prod)
       --http                Serve plain HTTP instead of HTTPS
       --prod                Minified bundles, stronger compression, no source maps
-  -h, --help                Show this help
+      --help                Show this help
 `;
 
 export class UsageError extends Error {}
@@ -41,15 +45,16 @@ export function parseOptions(argv: string[]): Options | null {
   let values;
   try {
     ({ values } = parseArgs({
-      args: argv,
+      args: normalizeHot(argv),
       options: {
         dir: { type: "string", short: "d", default: "." },
         port: { type: "string", short: "p", default: "3000" },
         compression: { type: "string", short: "c", default: "br,gz" },
         extensions: { type: "string", short: "x", default: "marko,html" },
+        hot: { type: "string" },
         http: { type: "boolean", default: false },
         prod: { type: "boolean", default: false },
-        help: { type: "boolean", short: "h", default: false },
+        help: { type: "boolean", default: false },
       },
     }));
   } catch (err) {
@@ -82,7 +87,47 @@ export function parseOptions(argv: string[]): Options | null {
     extensions: parseExtensions(values.extensions),
     http: values.http,
     prod: values.prod,
+    hot: parseHot(values.hot) ?? !values.prod,
   };
+}
+
+/**
+ * The value of `-h`/`--hot` is optional, which `parseArgs` has no notion of,
+ * so the flag is rewritten into the `--hot=<value>` form it does understand.
+ */
+function normalizeHot(argv: string[]): string[] {
+  const args: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "--") return [...args, ...argv.slice(i)];
+    if (arg !== "-h" && arg !== "--hot") {
+      args.push(arg);
+      continue;
+    }
+    const next = argv[i + 1];
+    if (next === "on" || next === "off") {
+      args.push(`--hot=${next}`);
+      i++;
+    } else {
+      args.push("--hot=on");
+    }
+  }
+  return args;
+}
+
+function parseHot(value: string | undefined): boolean | undefined {
+  switch (value) {
+    case undefined:
+      return undefined;
+    case "on":
+      return true;
+    case "off":
+      return false;
+    default:
+      throw new UsageError(
+        `Invalid value "${value}" for --hot (expected "on" or "off")`,
+      );
+  }
 }
 
 /** Parses an `--extensions` value such as `marko,html` into an ordered list of extensions. */

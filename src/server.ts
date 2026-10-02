@@ -10,11 +10,21 @@ import {
   negotiate,
   type Encoding,
 } from "./compression.ts";
+import {
+  wsPath,
+  wsScript,
+  wsScriptPath,
+  wsScriptTag,
+  type WsMessage,
+} from "./ws.ts";
 import { loadMarko } from "./marko.ts";
 import type { Options } from "./options.ts";
 import { watchDir } from "./watcher.ts";
 
 const markoExt = ".marko";
+const wsTopic = "hot";
+const htmlReg = /\.html?$/i;
+const wsScriptTagBytes = Buffer.from(`\n${wsScriptTag}\n`);
 /** Bodies smaller than this are not worth compressing. */
 const minCompressSize = 1024;
 /** Files larger than this are streamed from disk instead of compressed in memory. */
@@ -39,9 +49,13 @@ export async function serveDir(
   const root = options.dir;
   const relative = (file: string) => path.relative(root, file);
 
+  // Pages reload, or swap their stylesheets, when what they show changes.
+  const hot = options.hot;
+
   const bundler = new Bundler({
     root,
     prod: options.prod,
+    script: hot ? wsScriptPath : undefined,
     marko: await loadMarko(root),
     onBuild({ pages, error, ms }) {
       if (error) {
@@ -169,18 +183,26 @@ ${rows.join("\n")}
     mtime: Date,
   ) => {
     const blob = Bun.file(file);
-    const etag = `W/"${size.toString(36)}-${Math.round(mtime.getTime()).toString(36)}"`;
+    // HTML pages take part in live reload like rendered pages do, which
+    // makes them a different response from the file itself.
+    const inject = hot && htmlReg.test(file) && size <= maxCompressSize;
+    const etag = `W/"${size.toString(36)}-${Math.round(mtime.getTime()).toString(36)}${inject ? "-hot" : ""}"`;
     const headers = new Headers({
       "content-type": blob.type,
       "cache-control": "no-cache",
       "last-modified": mtime.toUTCString(),
-      "accept-ranges": "bytes",
       etag,
     });
 
     if (isFresh(req, etag, mtime)) {
       return new Response(null, { status: 304, headers });
     }
+
+    if (inject) {
+      const body = Buffer.concat([await blob.bytes(), wsScriptTagBytes]);
+      return send(req, body, headers, `${file}\0${etag}`);
+    }
+    headers.set("accept-ranges", "bytes");
 
     const range = req.headers.get("range");
     if (range) {
@@ -258,7 +280,7 @@ ${rows.join("\n")}
       { status: 500, headers: { "content-type": "text/plain; charset=utf-8" } },
     );
 
-  const fetch = async (req: Request) => {
+  const fetch = async (req: Request, server: Bun.Server<undefined>) => {
     if (req.method !== "GET" && req.method !== "HEAD") {
       return new Response("Method Not Allowed", {
         status: 405,
@@ -274,6 +296,24 @@ ${rows.join("\n")}
       return new Response("Bad Request", { status: 400 });
     }
 
+    if (hot && pathname === wsPath) {
+      if (server.upgrade(req)) return;
+      return new Response("Upgrade Required", {
+        status: 426,
+        headers: { upgrade: "websocket" },
+      });
+    }
+    if (hot && pathname === wsScriptPath) {
+      return send(
+        req,
+        Buffer.from(wsScript),
+        new Headers({
+          "content-type": "text/javascript; charset=utf-8",
+          "cache-control": "no-cache",
+        }),
+        wsScriptPath,
+      );
+    }
     if (pathname === assetsPrefix) return serveAssetIndex(req);
     if (pathname + "/" === assetsPrefix) {
       return new Response(null, {
@@ -340,6 +380,12 @@ ${rows.join("\n")}
         http2: true,
         tls,
         fetch,
+        websocket: {
+          open(socket) {
+            socket.subscribe(wsTopic);
+          },
+          message() {},
+        },
         error(error) {
           log.error(errorMessage(error, true));
           return new Response("Internal Server Error", { status: 500 });
@@ -365,10 +411,55 @@ ${rows.join("\n")}
     throw error;
   }
 
+  const publish = (message: WsMessage) => {
+    for (const server of servers) {
+      server.publish(wsTopic, JSON.stringify(message));
+    }
+  };
+
+  const update = async (paths: Set<string>) => {
+    const { build, bundled } = await bundler.update(paths);
+    if (!hot) return;
+
+    if (build?.error) {
+      publish({
+        type: "error",
+        message: `Bundling failed\n${errorMessage(build.error)}`,
+      });
+    }
+
+    // Changes to what is bundled show in the build, any other file that
+    // changed may be one a page shows as it is.
+    let reload = build?.changes.reload ?? false;
+    const files: string[] = [];
+    for (const changedPath of paths) {
+      if (reload) break;
+      const relativePath = relative(changedPath);
+      if (
+        bundled.has(changedPath) ||
+        isTagsPath(relativePath) ||
+        // Editors leave backups behind.
+        changedPath.endsWith("~") ||
+        !(await stat(changedPath).catch(() => null))?.isFile()
+      ) {
+        continue;
+      }
+      if (changedPath.endsWith(".css")) {
+        files.push("/" + relativePath.split(path.sep).join("/"));
+      } else {
+        reload = true;
+      }
+    }
+
+    const styles = build?.changes.styles ?? [];
+    if (reload) publish({ type: "reload" });
+    else if (styles.length || files.length) {
+      publish({ type: "styles", styles, files });
+    }
+  };
+
   const watcher = watchDir(root, (paths) => {
-    bundler
-      .update(paths)
-      .catch((error) => log.error(errorMessage(error, true)));
+    update(paths).catch((error) => log.error(errorMessage(error, true)));
   });
 
   return {

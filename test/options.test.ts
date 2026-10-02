@@ -11,7 +11,32 @@ test("defaults", () => {
     extensions: ["marko", "html"],
     http: false,
     prod: false,
+    hot: true,
   });
+});
+
+test("hot is on by default, except in production", () => {
+  const hot = (...argv: string[]) => parseOptions(argv)!.hot;
+  expect(hot()).toBe(true);
+  expect(hot("--prod")).toBe(false);
+
+  expect(hot("--hot")).toBe(true);
+  expect(hot("-h")).toBe(true);
+  expect(hot("--prod", "--hot")).toBe(true);
+  expect(hot("-h", "--prod")).toBe(true);
+  expect(hot("--prod", "--hot", "on")).toBe(true);
+
+  expect(hot("--hot", "off")).toBe(false);
+  expect(hot("-h", "off")).toBe(false);
+  expect(hot("--hot=off")).toBe(false);
+  expect(hot("--prod", "-h", "off")).toBe(false);
+
+  // What follows the flag is only its value when it is one.
+  expect(parseOptions(["-h", "-p", "8080"])).toMatchObject({
+    hot: true,
+    port: 8080,
+  });
+  expect(() => parseOptions(["--hot=maybe"])).toThrow(UsageError);
 });
 
 test("flags", () => {
@@ -35,6 +60,7 @@ test("flags", () => {
     extensions: ["htm", "html"],
     http: true,
     prod: true,
+    hot: false,
   });
 });
 

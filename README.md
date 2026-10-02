@@ -14,14 +14,16 @@ bun install
 bun src/cli.ts --dir example
 ```
 
-| Option                | Default      | Description                                                                              |
-| --------------------- | ------------ | ---------------------------------------------------------------------------------------- |
-| `-d`, `--dir`         | `.`          | Directory to serve.                                                                      |
-| `-p`, `--port`        | `3000`       | Port to listen on. Fails when the port is taken.                                         |
-| `-c`, `--compression` | `br,gz`      | Encodings in order of preference: `br`, `gz`, `zstd`, `deflate`, or `none`.              |
-| `-x`, `--extensions`  | `marko,html` | Extensions to try, in order, for paths without one and for directory indexes, or `none`. |
-| `--http`              |              | Serve plain HTTP instead of HTTPS.                                                       |
-| `--prod`              |              | Minified bundles, stronger compression and no source maps.                               |
+| Option                | Default               | Description                                                                              |
+| --------------------- | --------------------- | ---------------------------------------------------------------------------------------- |
+| `-d`, `--dir`         | `.`                   | Directory to serve.                                                                      |
+| `-p`, `--port`        | `3000`                | Port to listen on. Fails when the port is taken.                                         |
+| `-c`, `--compression` | `br,gz`               | Encodings in order of preference: `br`, `gz`, `zstd`, `deflate`, or `none`.              |
+| `-x`, `--extensions`  | `marko,html`          | Extensions to try, in order, for paths without one and for directory indexes, or `none`. |
+| `-h`, `--hot`         | on, off with `--prod` | Reload pages and swap their styles when files change. `--hot off` turns it off.          |
+| `--http`              |                       | Serve plain HTTP instead of HTTPS.                                                       |
+| `--prod`              |                       | Minified bundles, stronger compression and no source maps.                               |
+| `--help`              |                       | Show the options.                                                                        |
 
 By default the server uses HTTPS with a self-signed certificate that is
 generated on first use and kept in `~/.cache/svdr` (or
@@ -69,6 +71,22 @@ into the bundles changes, the pages are bundled again. When that fails, the
 error is logged and the last working build keeps being served until the
 problem is fixed; only pages that have never been bundled respond with the
 error.
+
+## Live reload
+
+With `--hot`, which is on by default except with `--prod`, every page
+connects to the server with a WebSocket at `/_svdr/ws` and is kept up to
+date as files change:
+
+- When only styles changed, whether in a `<style>` block or in a stylesheet
+  the page links to, the stylesheets are swapped in place and the page keeps
+  its state.
+- When anything else a page may show changed, the page reloads.
+- When bundling fails, the error is logged to the browser console and the
+  page stays as it is.
+
+Plain `.html` files take part too: the script that connects them is
+appended to them as they are served.
 
 ## Development
 

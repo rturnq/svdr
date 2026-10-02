@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { cp, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { WsMessage } from "../src/ws.ts";
 import type { Options } from "../src/options.ts";
 import { serveDir, type Logger, type ServeDir } from "../src/server.ts";
 
@@ -31,6 +32,7 @@ function start(
       extensions: ["marko", "html"],
       http: true,
       prod: false,
+      hot: !overrides.prod,
       ...overrides,
     },
     log,
@@ -44,6 +46,16 @@ async function waitFor<T>(check: () => Promise<T | false | undefined>) {
     await Bun.sleep(25);
   }
   throw new Error("Timed out");
+}
+
+const wsScriptUrl = "/_svdr/ws.js";
+
+/** The URLs of the bundled files a page links to. */
+function bundledUrls(html: string) {
+  return Array.from(
+    html.matchAll(/(?:href|src)="(\/_svdr\/[^"]+)"/g),
+    (match) => match[1]!,
+  ).filter((url) => url !== wsScriptUrl);
 }
 
 afterAll(async () => {
@@ -109,9 +121,9 @@ describe("development", () => {
     await writeFile(path.join(dir, "docs/readme.html"), "not exact");
 
     // Without a trailing slash a path is a file, with one it is a directory.
-    expect(await (await get("/docs")).text()).toBe("docs file");
-    expect(await (await get("/docs/")).text()).toBe("docs index");
-    expect(await (await get("/docs/guide")).text()).toBe("guide");
+    expect(await (await get("/docs")).text()).toStartWith("docs file");
+    expect(await (await get("/docs/")).text()).toStartWith("docs index");
+    expect(await (await get("/docs/guide")).text()).toStartWith("guide");
     expect((await get("/docs/guide/")).status).toBe(404);
     expect((await get("/docs.html/")).status).toBe(404);
 
@@ -124,7 +136,7 @@ describe("development", () => {
     await writeFile(path.join(dir, "about.html"), "about file");
     try {
       expect(await (await get("/about")).text()).toContain("<h1>About</h1>");
-      expect(await (await get("/about.html")).text()).toBe("about file");
+      expect(await (await get("/about.html")).text()).toStartWith("about file");
     } finally {
       await rm(path.join(dir, "about.html"));
     }
@@ -159,11 +171,7 @@ describe("development", () => {
       return res.status === 200 && (await res.text());
     });
     const index = await (await get("/")).text();
-    const assets = (html: string) =>
-      Array.from(
-        html.matchAll(/(?:href|src)="(\/_svdr\/[^"]+)"/g),
-        (m) => m[1]!,
-      );
+    const assets = bundledUrls;
     const shared = assets(index).filter((url) => assets(other).includes(url));
 
     expect(shared.some((url) => url.endsWith(".js"))).toBe(true);
@@ -192,8 +200,10 @@ describe("development", () => {
         html.matchAll(
           /<(?:script type="module" src|link rel="modulepreload" href)="([^"]+)">/g,
         ),
-        ([, url]) => get(url!),
-      ),
+        ([, url]) => url!,
+      )
+        .filter((url) => url !== wsScriptUrl)
+        .map((url) => get(url)),
     );
     expect(scripts.length).toBeGreaterThan(0);
     for (const js of scripts) {
@@ -245,8 +255,8 @@ describe("development", () => {
 
     // Everything a page links to is listed, as are the server only files.
     const html = await (await get("/")).text();
-    for (const [, url] of html.matchAll(/(?:href|src)="\/_svdr\/([^"]+)"/g)) {
-      expect(rows.map((row) => row.href)).toContain(url!);
+    for (const url of bundledUrls(html)) {
+      expect(rows.map((row) => "/_svdr/" + row.href)).toContain(url);
     }
     const serverFiles = rows.filter((row) => row.href!.startsWith("server/"));
     expect(
@@ -298,7 +308,7 @@ describe("development", () => {
   test("ships no script for pages without client side behavior", async () => {
     const html = await (await get("/about.marko")).text();
     expect(html).toContain("<h1>About</h1>");
-    expect(html).not.toContain("<script");
+    expect(bundledUrls(html)).toEqual([]);
   });
 
   test("compresses with the preferred encoding the client accepts", async () => {
@@ -391,6 +401,186 @@ test("shows the error when the first build fails", async () => {
   }
 });
 
+describe("live reload", () => {
+  let dir: string;
+  let server: ServeDir;
+  let socket: WebSocket;
+  let received: WsMessage[] = [];
+  const text = async (pathname: string) =>
+    (await fetch(server.url + pathname)).text();
+  /** Waits for the message of the next change, which must be the only one. */
+  const message = async () => {
+    await waitFor(async () => received.length > 0);
+    // Give messages that should not have been sent a chance to arrive.
+    await Bun.sleep(150);
+    const messages = received;
+    received = [];
+    expect(messages).toHaveLength(1);
+    return messages[0]!;
+  };
+
+  beforeAll(async () => {
+    dir = await createSite();
+    server = await start(dir);
+    socket = new WebSocket(server.url.replace("http", "ws") + "/_svdr/ws");
+    socket.onmessage = (event) => received.push(JSON.parse(event.data));
+    await new Promise((resolve, reject) => {
+      socket.onopen = resolve;
+      socket.onerror = reject;
+    });
+  });
+  afterAll(async () => {
+    socket.close();
+    await server.stop();
+  });
+
+  const tag = `<script type="module" src="${wsScriptUrl}"></script>`;
+
+  test("adds its script to every page", async () => {
+    expect(await text("/")).toContain(tag);
+    expect(await text("/about")).toContain(tag);
+
+    const script = await fetch(server.url + wsScriptUrl);
+    expect(script.status).toBe(200);
+    expect(script.headers.get("content-type")).toStartWith("text/javascript");
+    expect(await script.text()).toContain("new WebSocket");
+    // It is not a bundled file.
+    expect(await text("/_svdr/")).not.toContain("ws.js");
+    expect((await fetch(server.url + "/_svdr/ws")).status).toBe(426);
+  });
+
+  test("appends its script to html files", async () => {
+    const html = "<!doctype html>\n<title>Plain</title>\n<p>Plain</p>\n";
+    await writeFile(path.join(dir, "plain.html"), html);
+    await Bun.sleep(150);
+    received = [];
+
+    const res = await fetch(server.url + "/plain");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toStartWith("text/html");
+    expect(await res.text()).toBe(`${html}\n${tag}\n`);
+    expect(res.headers.get("content-length")).toBe(
+      String(Buffer.byteLength(`${html}\n${tag}\n`)),
+    );
+
+    const etag = res.headers.get("etag")!;
+    const fresh = await fetch(server.url + "/plain.html", {
+      headers: { "if-none-match": etag },
+    });
+    expect(fresh.status).toBe(304);
+    // A page that is served differently is a different response.
+    const plain = await start(dir, { hot: false });
+    try {
+      const asIs = await fetch(plain.url + "/plain.html");
+      expect(await asIs.text()).toBe(html);
+      expect(asIs.headers.get("etag")).not.toBe(etag);
+    } finally {
+      await plain.stop();
+    }
+  });
+
+  test("swaps bundled stylesheets when only styles changed", async () => {
+    const before = bundledUrls(await text("/")).filter((url) =>
+      url.endsWith(".css"),
+    );
+    const file = path.join(dir, "index.marko");
+    await writeFile(
+      file,
+      (await Bun.file(file).text()).replace("rebeccapurple", "seagreen"),
+    );
+
+    const update = await message();
+    if (update.type !== "styles") throw new Error(`Got ${update.type}`);
+    expect(update.files).toEqual([]);
+    expect(update.styles).toHaveLength(1);
+    const [from, to] = update.styles[0]!;
+    expect(before).toContain(from);
+    expect(to).not.toBe(from);
+    expect(await text(to)).toContain("seagreen");
+    // The page now links the new stylesheet in place of the old one.
+    const after = bundledUrls(await text("/"));
+    expect(after).toContain(to);
+    expect(after).not.toContain(from);
+  });
+
+  test("swaps stylesheets that are served as they are", async () => {
+    await writeFile(path.join(dir, "assets/site.css"), "body { margin: 0 }\n");
+    expect(await message()).toEqual({
+      type: "styles",
+      styles: [],
+      files: ["/assets/site.css"],
+    });
+  });
+
+  test("reloads when a page changed", async () => {
+    await writeFile(
+      path.join(dir, "greeting.js"),
+      "export const greeting = (name) => `Changed ${name}`;\n",
+    );
+    expect(await message()).toEqual({ type: "reload" });
+    expect(await text("/")).toContain("<h1>Changed svdr</h1>");
+  });
+
+  test("reloads when a file that is served as it is changed", async () => {
+    await writeFile(path.join(dir, "assets/hello.txt"), "Changed\n");
+    expect(await message()).toEqual({ type: "reload" });
+  });
+
+  test("does nothing when nothing a page shows changed", async () => {
+    // Written again as it was, in a tags directory, hidden and removed.
+    const file = path.join(dir, "about.marko");
+    await writeFile(file, await Bun.file(file).text());
+    await writeFile(path.join(dir, "tags/note.txt"), "note");
+    await writeFile(path.join(dir, ".hidden"), "hidden");
+    await rm(path.join(dir, "assets/hello.txt"));
+    await Bun.sleep(400);
+    await server.bundler.settled;
+    expect(received).toEqual([]);
+  });
+
+  test("reports a failed build without reloading", async () => {
+    const file = path.join(dir, "about.marko");
+    const source = await Bun.file(file).text();
+    await writeFile(file, "<h1>Broken ${");
+    const failed = await message();
+    if (failed.type !== "error") throw new Error(`Got ${failed.type}`);
+    expect(failed.message).toContain("Bundling failed");
+
+    // Fixing it gets back to what the page already shows.
+    await writeFile(file, source);
+    await Bun.sleep(400);
+    await server.bundler.settled;
+    expect(received).toEqual([]);
+  });
+});
+
+test("live reload can be turned off, and on in production", async () => {
+  const dir = await createSite();
+  const tag = `<script type="module" src="${wsScriptUrl}"></script>`;
+
+  for (const prod of [false, true]) {
+    const off = await start(dir, { prod, hot: false });
+    try {
+      expect(await (await fetch(off.url + "/")).text()).not.toContain(
+        "/_svdr/ws",
+      );
+      expect((await fetch(off.url + wsScriptUrl)).status).toBe(404);
+      expect((await fetch(off.url + "/_svdr/ws")).status).toBe(404);
+    } finally {
+      await off.stop();
+    }
+
+    const on = await start(dir, { prod, hot: true });
+    try {
+      expect(await (await fetch(on.url + "/")).text()).toContain(tag);
+      expect((await fetch(on.url + wsScriptUrl)).status).toBe(200);
+      expect((await fetch(on.url + "/_svdr/ws")).status).toBe(426);
+    } finally {
+      await on.stop();
+    }
+  }
+});
+
 test("fails when the port is taken", async () => {
   const dir = await createSite();
   const server = await start(dir);
@@ -430,8 +620,12 @@ test("only uses the configured extensions", async () => {
   await writeFile(path.join(dir, "page.htm"), "htm page");
   const server = await start(dir, { extensions: ["htm", "html"] });
   try {
-    expect(await (await fetch(server.url + "/")).text()).toBe("html index");
-    expect(await (await fetch(server.url + "/page")).text()).toBe("htm page");
+    expect(await (await fetch(server.url + "/")).text()).toStartWith(
+      "html index",
+    );
+    expect(await (await fetch(server.url + "/page")).text()).toStartWith(
+      "htm page",
+    );
     expect((await fetch(server.url + "/about")).status).toBe(404);
     expect((await fetch(server.url + "/about.marko")).status).toBe(200);
   } finally {

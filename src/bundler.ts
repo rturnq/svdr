@@ -53,7 +53,23 @@ export interface BuildResult {
    * build that worked.
    */
   error?: Error;
+  /** What a page that was rendered by the previous build has to do to be current. */
+  changes: Changes;
   ms: number;
+}
+
+export interface Changes {
+  /** Whether anything but stylesheets changed. */
+  reload: boolean;
+  /** The stylesheets that were replaced, as pairs of the old and new URL path. */
+  styles: [from: string, to: string][];
+}
+
+export interface UpdateResult {
+  /** The build, if the changes called for one. */
+  build?: BuildResult;
+  /** The changed paths that are part of the bundles. */
+  bundled: Set<string>;
 }
 
 type AssetTag = ["style" | "preload" | "script", string];
@@ -63,6 +79,8 @@ export interface BundlerOptions {
   root: string;
   marko: MarkoToolchain;
   prod: boolean;
+  /** URL of a script to load on every page. */
+  script?: string;
   onBuild?(result: BuildResult): void;
 }
 
@@ -92,13 +110,15 @@ export class Bundler {
   pages = new Map<string, Page>();
   #opts: BundlerOptions;
   #assets = new Map<string, Asset>();
+  /** What each stylesheet is made of, to tell which one replaces which. */
+  #styleKeys = new Map<string, string>();
   /** Files that went into the bundles and trigger a rebuild when changed. */
   #deps = new Set<string>();
   #failed = false;
   #tmpDir: Promise<string> | undefined;
   #outDir: string | undefined;
   #builds = 0;
-  #queue: Promise<void> = Promise.resolve();
+  #queue: Promise<unknown> = Promise.resolve();
 
   constructor(opts: BundlerOptions) {
     this.#opts = opts;
@@ -106,7 +126,7 @@ export class Bundler {
 
   /** Resolves once all changes reported so far have been bundled. */
   get settled(): Promise<void> {
-    return this.#queue;
+    return this.#queue.then(() => {});
   }
 
   /** The files of the last build that worked, by URL path. */
@@ -115,18 +135,26 @@ export class Bundler {
   }
 
   /** Finds and bundles all pages in the served directory. */
-  scan(): Promise<void> {
-    return this.#enqueue(async () => {
-      await this.#build(await findPages(this.#opts.root));
-    });
+  scan(): Promise<BuildResult> {
+    return this.#enqueue(async () =>
+      this.#build(await findPages(this.#opts.root)),
+    );
   }
 
   /** Bundles the pages again if the given added, changed or removed paths affect them. */
-  update(changed: Iterable<string>): Promise<void> {
-    const paths = [...changed];
+  update(changed: Iterable<string>): Promise<UpdateResult> {
+    const paths = [...changed].filter(
+      (changedPath) => !isIgnored(path.relative(this.#opts.root, changedPath)),
+    );
     return this.#enqueue(async () => {
-      const { root } = this.#opts;
-      const files = await findPages(root);
+      const files = await findPages(this.#opts.root);
+      const previousDeps = this.#deps;
+      const isBundled = (changedPath: string) =>
+        // Any template may be a tag that is (or now could be) used by a page.
+        changedPath.endsWith(markoExt) ||
+        taglibFileReg.test(changedPath) ||
+        previousDeps.has(changedPath) ||
+        this.#deps.has(changedPath);
       let stale =
         this.#failed ||
         files.length !== this.pages.size ||
@@ -134,13 +162,7 @@ export class Bundler {
 
       for (const changedPath of paths) {
         if (stale) break;
-        if (isIgnored(path.relative(root, changedPath))) continue;
-        if (
-          // Any template may be a tag that is (or now could be) used by a page.
-          changedPath.endsWith(markoExt) ||
-          taglibFileReg.test(changedPath) ||
-          this.#deps.has(changedPath)
-        ) {
+        if (isBundled(changedPath)) {
           stale = true;
           break;
         }
@@ -154,7 +176,10 @@ export class Bundler {
             );
       }
 
-      if (stale) await this.#build(files);
+      return {
+        build: stale ? await this.#build(files) : undefined,
+        bundled: new Set(paths.filter(isBundled)),
+      };
     });
   }
 
@@ -165,15 +190,16 @@ export class Bundler {
     }
   }
 
-  #enqueue(task: () => Promise<void>): Promise<void> {
+  #enqueue<T>(task: () => Promise<T>): Promise<T> {
     const result = this.#queue.then(task);
     this.#queue = result.catch(() => {});
     return result;
   }
 
-  async #build(files: string[]) {
+  async #build(files: string[]): Promise<BuildResult> {
     const start = performance.now();
     let error: Error | undefined;
+    let changes: Changes = { reload: false, styles: [] };
 
     // Adding or removing a template can change which file a tag resolves to.
     this.#opts.marko.compiler.taglib.clearCaches();
@@ -188,11 +214,19 @@ export class Bundler {
         : {
             pages: [],
             assets: new Map<string, Asset>(),
+            styleKeys: new Map<string, string>(),
             deps: new Set<string>(),
           };
+      changes = diff(
+        this.#assets,
+        this.#styleKeys,
+        bundled.assets,
+        bundled.styleKeys,
+      );
       staleOutDir = this.#outDir;
       this.pages = new Map(bundled.pages.map((page) => [page.file, page]));
       this.#assets = bundled.assets;
+      this.#styleKeys = bundled.styleKeys;
       this.#deps = bundled.deps;
       this.#outDir = outDir;
       this.#failed = false;
@@ -209,11 +243,14 @@ export class Bundler {
     }
 
     if (staleOutDir) await rm(staleOutDir, { recursive: true, force: true });
-    this.#opts.onBuild?.({
+    const result: BuildResult = {
       pages: [...this.pages.values()],
       error,
+      changes,
       ms: performance.now() - start,
-    });
+    };
+    this.#opts.onBuild?.(result);
+    return result;
   }
 
   async #bundle(files: string[], outDir: string) {
@@ -332,7 +369,14 @@ export class Bundler {
       await clientBuild.close();
     }
 
-    const manifest = createManifest(clientChunks, css, imports, assetIds, emit);
+    const { manifest, styleKeys } = createManifest(
+      clientChunks,
+      css,
+      imports,
+      assetIds,
+      emit,
+      this.#opts.script,
+    );
     const pages = await Promise.all(
       serverChunks.map(async (chunk): Promise<Page | undefined> => {
         const entry = chunk.isEntry && parseEntryId(chunk.facadeModuleId ?? "");
@@ -351,6 +395,7 @@ export class Bundler {
     return {
       pages: pages.filter((page) => page !== undefined),
       assets,
+      styleKeys,
       deps,
     };
   }
@@ -366,6 +411,35 @@ function isEmptyChunk(chunk: OutputChunk) {
 }
 
 /**
+ * Compares the files of two builds. Only when nothing but the content of
+ * stylesheets differs can a page pick up the changes without being reloaded.
+ */
+function diff(
+  previous: ReadonlyMap<string, Asset>,
+  previousStyleKeys: ReadonlyMap<string, string>,
+  next: ReadonlyMap<string, Asset>,
+  nextStyleKeys: ReadonlyMap<string, string>,
+): Changes {
+  // Source maps are not part of what a page shows.
+  const changed = (from: ReadonlyMap<string, Asset>, to: typeof from) =>
+    [...from.keys()].filter((url) => !to.has(url) && !url.endsWith(".map"));
+  const removed = changed(previous, next);
+  const added = changed(next, previous);
+  const styles: Changes["styles"] = [];
+
+  for (const url of removed) {
+    const key = previousStyleKeys.get(url);
+    const replacement =
+      key !== undefined && added.find((to) => nextStyleKeys.get(to) === key);
+    if (!replacement) return { reload: true, styles: [] };
+    styles.push([url, replacement]);
+  }
+  return styles.length === added.length
+    ? { reload: false, styles }
+    : { reload: true, styles: [] };
+}
+
+/**
  * Works out which stylesheets and scripts the server has to write for each
  * page and each lazily loaded template, emitting the stylesheets along the
  * way.
@@ -376,7 +450,8 @@ function createManifest(
   imports: Map<string, ModuleImports>,
   assetIds: AssetIds,
   emit: Emit,
-): AssetManifest {
+  script: string | undefined,
+): { manifest: AssetManifest; styleKeys: Map<string, string> } {
   const chunksByName = new Map(chunks.map((chunk) => [chunk.fileName, chunk]));
   const toUrl = (fileName: string) => encodeURI(assetsPrefix + fileName);
   const manifest: AssetManifest = {};
@@ -415,8 +490,12 @@ function createManifest(
     return tags;
   };
 
-  const entries: { assetId: string; chunk: OutputChunk; styleIds: string[] }[] =
-    [];
+  const entries: {
+    assetId: string;
+    chunk: OutputChunk;
+    styleIds: string[];
+    isPage: boolean;
+  }[] = [];
   const pageEntries: [file: string, chunk: OutputChunk][] = [];
   const lazyStyleIds = new Set<string>();
 
@@ -432,7 +511,7 @@ function createManifest(
     if (!assetId) continue;
     const styleIds = collectStyles(chunk.facadeModuleId!, true);
     for (const id of styleIds) lazyStyleIds.add(id);
-    entries.push({ assetId, chunk, styleIds });
+    entries.push({ assetId, chunk, styleIds, isPage: false });
   }
 
   for (const [file, chunk] of pageEntries) {
@@ -444,7 +523,7 @@ function createManifest(
     const styleIds = collectStyles(chunk.facadeModuleId!, true).filter(
       (id) => loaded.has(id) || !lazyStyleIds.has(id),
     );
-    entries.push({ assetId, chunk, styleIds });
+    entries.push({ assetId, chunk, styleIds, isPage: true });
   }
 
   // Like scripts, styles are split up by which entries use them, so that
@@ -465,6 +544,7 @@ function createManifest(
     else groups.set(key, [id]);
   }
   const styles = new Map<string, AssetTag>();
+  const styleKeys = new Map<string, string>();
   for (const ids of groups.values()) {
     const body = Buffer.from(
       ids
@@ -478,10 +558,13 @@ function createManifest(
       .replace(/(?:\.marko(?:\.\d+)?)?\.css$/, "");
     const fileName = `${name}-${Bun.hash(body).toString(36)}.css`;
     emit(fileName, body, "text/css; charset=utf-8");
+    styleKeys.set(assetsPrefix + fileName, ids.join("\0"));
     for (const id of ids) styles.set(id, ["style", toUrl(fileName)]);
   }
 
-  for (const { assetId, chunk, styleIds } of entries) {
+  for (const { assetId, chunk, styleIds, isPage } of entries) {
+    const scripts = scriptTags(chunk);
+    if (isPage && script) scripts.push(["script", script]);
     manifest[assetId] = {
       block: [
         ...new Set(
@@ -490,11 +573,11 @@ function createManifest(
             .filter((tag) => tag !== undefined),
         ),
       ],
-      defer: scriptTags(chunk),
+      defer: scripts,
     };
   }
 
-  return manifest;
+  return { manifest, styleKeys };
 }
 
 /** Finds the `.marko` files that are pages, which excludes those in `tags` directories. */
