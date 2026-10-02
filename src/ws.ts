@@ -1,4 +1,8 @@
-import { assetsPrefix } from "./bundler.ts";
+import { stat } from "node:fs/promises";
+import path from "node:path";
+import { assetsPrefix, type UpdateResult } from "./bundler.ts";
+import wsScript from "./client/ws.js" with { type: "text" };
+import { isServable } from "./paths.ts";
 
 /** Where pages connect to with a WebSocket to hear about changes. */
 export const wsPath = `${assetsPrefix}ws`;
@@ -6,6 +10,7 @@ export const wsPath = `${assetsPrefix}ws`;
 export const wsScriptPath = `${wsPath}.js`;
 /** How a page loads that script. */
 export const wsScriptTag = `<script type="module" src="${wsScriptPath}"></script>`;
+export { wsScript };
 
 export type WsMessage =
   /** Something changed that the page can only pick up by loading again. */
@@ -19,58 +24,48 @@ export type WsMessage =
     }
   | { type: "error"; message: string };
 
-export const wsScript = `const url = new URL(${JSON.stringify(wsPath)}, location.href);
-url.protocol = url.protocol.replace("http", "ws");
-let lost = false;
+/**
+ * Works out what pages have to do about the given changed paths, after the
+ * bundler has dealt with them.
+ */
+export async function messagesFor(
+  root: string,
+  paths: Iterable<string>,
+  { build, bundled }: UpdateResult,
+  describeError: (error: Error) => string,
+): Promise<WsMessage[]> {
+  const messages: WsMessage[] = [];
+  if (build?.error) {
+    messages.push({ type: "error", message: describeError(build.error) });
+  }
 
-function connect() {
-  const socket = new WebSocket(url);
-  socket.onopen = () => {
-    // The server was restarted, so anything may have changed.
-    if (lost) location.reload();
-  };
-  socket.onmessage = (event) => {
-    const message = JSON.parse(event.data);
-    switch (message.type) {
-      case "reload":
-        location.reload();
-        break;
-      case "styles":
-        swapStyles(message);
-        break;
-      case "error":
-        console.error("[svdr] " + message.message);
-        break;
+  // Changes to what is bundled show in the build, any other file that
+  // changed may be one a page shows as it is.
+  let reload = build?.changes.reload ?? false;
+  const files: string[] = [];
+  for (const changedPath of paths) {
+    if (reload) break;
+    const relativePath = path.relative(root, changedPath);
+    if (
+      bundled.has(changedPath) ||
+      !isServable(relativePath) ||
+      // Editors leave backups behind.
+      changedPath.endsWith("~") ||
+      !(await stat(changedPath).catch(() => null))?.isFile()
+    ) {
+      continue;
     }
-  };
-  socket.onclose = () => {
-    lost = true;
-    setTimeout(connect, 1000);
-  };
-}
-
-function swapStyles({ styles, files }) {
-  for (const link of document.querySelectorAll('link[rel~="stylesheet"]')) {
-    const current = new URL(link.href);
-    if (current.origin !== location.origin) continue;
-    const path = decodeURI(current.pathname);
-    const replaced = styles.find(([from]) => from === path);
-    if (replaced) {
-      swap(link, encodeURI(replaced[1]));
-    } else if (files.includes(path)) {
-      // The URL stays the same, so the query is what makes the browser fetch it again.
-      swap(link, current.pathname + "?v=" + Date.now());
+    if (changedPath.endsWith(".css")) {
+      files.push("/" + relativePath.split(path.sep).join("/"));
+    } else {
+      reload = true;
     }
   }
-}
 
-function swap(link, href) {
-  const next = link.cloneNode();
-  next.href = href;
-  // The old stylesheet stays until the new one is ready to avoid a flash of unstyled content.
-  next.onload = next.onerror = () => link.remove();
-  link.after(next);
+  const styles = build?.changes.styles ?? [];
+  if (reload) messages.push({ type: "reload" });
+  else if (styles.length || files.length) {
+    messages.push({ type: "styles", styles, files });
+  }
+  return messages;
 }
-
-connect();
-`;

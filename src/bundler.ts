@@ -1,8 +1,9 @@
-import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, readdir, realpath, rm, stat, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { rolldown, type OutputChunk } from "rolldown";
 import type { MarkoToolchain } from "./marko.ts";
+import { isIgnored, isTagsPath } from "./paths.ts";
 import {
   markoPlugins,
   parseEntryId,
@@ -84,22 +85,6 @@ export interface BundlerOptions {
   onBuild?(result: BuildResult): void;
 }
 
-/** Whether a path (relative to the served directory) is never scanned, watched or served. */
-export function isIgnored(relativePath: string): boolean {
-  return relativePath
-    .split(/[\\/]/)
-    .some((part) => part === "node_modules" || part[0] === ".");
-}
-
-/**
- * Whether a path (relative to the served directory) is inside a `tags`
- * directory. Those hold the custom tags pages are built from, which are
- * neither pages themselves nor served.
- */
-export function isTagsPath(relativePath: string): boolean {
-  return relativePath.split(/[\\/]/).includes("tags");
-}
-
 /**
  * Bundles the `.marko` pages of a directory together into a server bundle,
  * which is loaded to render the pages, and a client bundle, which is kept in
@@ -115,9 +100,14 @@ export class Bundler {
   /** Files that went into the bundles and trigger a rebuild when changed. */
   #deps = new Set<string>();
   #failed = false;
-  #tmpDir: Promise<string> | undefined;
-  #outDir: string | undefined;
-  #builds = 0;
+  /**
+   * Where the server bundle is written. One directory for every build: the
+   * names of its files include a hash of their content, so a file that did
+   * not change keeps its name and is not loaded again.
+   */
+  #outDir: Promise<string> | undefined;
+  /** The files of the last successful server bundle. */
+  #serverFiles = new Set<string>();
   #queue: Promise<unknown> = Promise.resolve();
 
   constructor(opts: BundlerOptions) {
@@ -185,8 +175,8 @@ export class Bundler {
 
   async close(): Promise<void> {
     await this.#queue;
-    if (this.#tmpDir) {
-      await rm(await this.#tmpDir, { recursive: true, force: true });
+    if (this.#outDir) {
+      await rm(await this.#outDir, { recursive: true, force: true });
     }
   }
 
@@ -204,9 +194,7 @@ export class Bundler {
     // Adding or removing a template can change which file a tag resolves to.
     this.#opts.marko.compiler.taglib.clearCaches();
 
-    this.#tmpDir ??= mkdtemp(path.join(os.tmpdir(), "svdr-"));
-    const outDir = path.join(await this.#tmpDir, String(this.#builds++));
-    let staleOutDir: string | undefined;
+    const outDir = await (this.#outDir ??= createOutDir());
 
     try {
       const bundled = files.length
@@ -216,6 +204,7 @@ export class Bundler {
             assets: new Map<string, Asset>(),
             styleKeys: new Map<string, string>(),
             deps: new Set<string>(),
+            serverFiles: new Set<string>(),
           };
       changes = diff(
         this.#assets,
@@ -223,16 +212,14 @@ export class Bundler {
         bundled.assets,
         bundled.styleKeys,
       );
-      staleOutDir = this.#outDir;
       this.pages = new Map(bundled.pages.map((page) => [page.file, page]));
       this.#assets = bundled.assets;
       this.#styleKeys = bundled.styleKeys;
       this.#deps = bundled.deps;
-      this.#outDir = outDir;
+      this.#serverFiles = bundled.serverFiles;
       this.#failed = false;
     } catch (err) {
       error = err as Error;
-      staleOutDir = outDir;
       // The last working build keeps being served. Only pages it does not
       // have, because they are new, have nothing to show but the error.
       this.pages = new Map(
@@ -242,7 +229,7 @@ export class Bundler {
       this.#failed = true;
     }
 
-    if (staleOutDir) await rm(staleOutDir, { recursive: true, force: true });
+    await this.#prune(outDir);
     const result: BuildResult = {
       pages: [...this.pages.values()],
       error,
@@ -251,6 +238,23 @@ export class Bundler {
     };
     this.#opts.onBuild?.(result);
     return result;
+  }
+
+  /** Removes files that are not part of the current server bundle. */
+  async #prune(outDir: string) {
+    const entries = await readdir(outDir, {
+      recursive: true,
+      withFileTypes: true,
+    });
+    await Promise.all(
+      entries.map(async (entry) => {
+        if (!entry.isFile()) return;
+        const file = path.join(entry.parentPath, entry.name);
+        if (!this.#serverFiles.has(file)) {
+          await unlink(file).catch(() => {});
+        }
+      }),
+    );
   }
 
   async #bundle(files: string[], outDir: string) {
@@ -287,6 +291,7 @@ export class Bundler {
       plugins: [plugins.server],
     });
     const assets = new Map<string, Asset>();
+    const serverFiles = new Set<string>();
     const now = new Date();
     const emit: Emit = (fileName, body, type) => {
       const url = assetsPrefix + fileName;
@@ -306,6 +311,9 @@ export class Bundler {
       serverChunks = output.filter((item) => item.type === "chunk");
       for (const chunk of serverChunks) {
         emit(serverDir + chunk.fileName, Buffer.from(chunk.code), scriptType);
+      }
+      for (const item of output) {
+        serverFiles.add(path.join(outDir, item.fileName));
       }
       for (const dep of await serverBuild.watchFiles) deps.add(dep);
     } finally {
@@ -397,8 +405,19 @@ export class Bundler {
       assets,
       styleKeys,
       deps,
+      serverFiles,
     };
   }
+}
+
+/**
+ * Creates the directory the server bundle is written to. Bun does not notice
+ * files added to a directory it reached through a symlink (such as macOS's
+ * `/var/folders`) once it has resolved a module there, so the path is
+ * resolved first.
+ */
+async function createOutDir() {
+  return mkdtemp(path.join(await realpath(os.tmpdir()), "svdr-"));
 }
 
 /** Whether a chunk has no code of its own and does not load any other chunk. */

@@ -2,6 +2,10 @@
   "name": "svdr",
   "version": "0.0.0",
   "description": "Simple directory server with bundling",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rturnq/serve-dir.git"
+  },
   "type": "module",
   "bin": {
     "svdr": "./src/cli.ts"
@@ -15,7 +19,9 @@
   "scripts": {
     "start": "bun src/cli.ts",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "check": "prettier --check . && tsc --noEmit && bun test"
   },
   "dependencies": {
     "@marko/compiler": "^5.42.10",
@@ -25,6 +31,7 @@
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",
+    "prettier": "^3.6.2",
     "typescript": "^7.0.2"
   }
 }

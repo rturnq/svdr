@@ -1,6 +1,6 @@
 import { watch, type FSWatcher } from "node:fs";
 import path from "node:path";
-import { isIgnored } from "./bundler.ts";
+import { isIgnored } from "./paths.ts";
 
 /**
  * Watches a directory recursively and reports the absolute paths that were

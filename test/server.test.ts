@@ -64,7 +64,7 @@ afterAll(async () => {
   );
 });
 
-describe("development", () => {
+describe("static files", () => {
   let dir: string;
   let server: ServeDir;
   const get = (pathname: string, init?: RequestInit) =>
@@ -100,10 +100,13 @@ describe("development", () => {
     expect(await res.text()).toBe("plain");
   });
 
-  test("does not serve missing, hidden or outside files", async () => {
+  test("does not serve missing, hidden, node_modules or outside files", async () => {
     await writeFile(path.join(dir, ".secret"), "hidden");
+    await mkdir(path.join(dir, "lib/node_modules"), { recursive: true });
+    await writeFile(path.join(dir, "lib/node_modules/dep.js"), "dep");
     expect((await get("/missing.txt")).status).toBe(404);
     expect((await get("/.secret")).status).toBe(404);
+    expect((await get("/lib/node_modules/dep.js")).status).toBe(404);
     expect((await get("/%2e%2e%2f%2e%2e%2fetc/passwd")).status).toBe(404);
     expect((await get("/assets/hello.txt/")).status).toBe(404);
   });
@@ -160,31 +163,19 @@ describe("development", () => {
       path.join(dir, "index.marko"),
     ]);
   });
+});
 
-  test("shares chunks between pages", async () => {
-    await writeFile(
-      path.join(dir, "other.marko"),
-      "<h1>Other</h1>\n<counter/>\n",
-    );
-    const other = await waitFor(async () => {
-      const res = await get("/other");
-      return res.status === 200 && (await res.text());
-    });
-    const index = await (await get("/")).text();
-    const assets = bundledUrls;
-    const shared = assets(index).filter((url) => assets(other).includes(url));
+describe("pages", () => {
+  let dir: string;
+  let server: ServeDir;
+  const get = (pathname: string, init?: RequestInit) =>
+    fetch(server.url + pathname, { redirect: "manual", ...init });
 
-    expect(shared.some((url) => url.endsWith(".js"))).toBe(true);
-    expect(shared.some((url) => url.endsWith(".css"))).toBe(true);
-    for (const url of shared) expect((await get(url)).status).toBe(200);
-    // Each page still has an entry of its own.
-    expect(assets(index).at(-1)).not.toBe(assets(other).at(-1));
-    await rm(path.join(dir, "other.marko"));
-    await waitFor(
-      async () => !server.bundler.pages.has(path.join(dir, "other.marko")),
-    );
-    expect((await get("/other")).status).toBe(404);
+  beforeAll(async () => {
+    dir = await createSite();
+    server = await start(dir);
   });
+  afterAll(() => server.stop());
 
   test("renders pages with their bundled assets", async () => {
     const res = await get("/index.marko");
@@ -226,6 +217,61 @@ describe("development", () => {
     expect(styles.join("\n")).toContain("rebeccapurple");
     expect(styles.join("\n")).toContain(".counter");
   });
+
+  test("ships no script for pages without client side behavior", async () => {
+    const html = await (await get("/about.marko")).text();
+    expect(html).toContain("<h1>About</h1>");
+    expect(bundledUrls(html)).toEqual([]);
+  });
+
+  test("compresses with the preferred encoding the client accepts", async () => {
+    const page = await get("/", { headers: { "accept-encoding": "gzip" } });
+    expect(page.headers.get("content-encoding")).toBe("gzip");
+    expect(await page.text()).toContain("<h1>Hello from svdr</h1>");
+
+    const identity = await get("/", {
+      headers: { "accept-encoding": "identity" },
+    });
+    expect(identity.headers.get("content-encoding")).toBeNull();
+  });
+
+  test("shares chunks between pages", async () => {
+    await writeFile(
+      path.join(dir, "other.marko"),
+      "<h1>Other</h1>\n<counter/>\n",
+    );
+    const other = await waitFor(async () => {
+      const res = await get("/other");
+      return res.status === 200 && (await res.text());
+    });
+    const index = await (await get("/")).text();
+    const assets = bundledUrls;
+    const shared = assets(index).filter((url) => assets(other).includes(url));
+
+    expect(shared.some((url) => url.endsWith(".js"))).toBe(true);
+    expect(shared.some((url) => url.endsWith(".css"))).toBe(true);
+    for (const url of shared) expect((await get(url)).status).toBe(200);
+    // Each page still has an entry of its own.
+    expect(assets(index).at(-1)).not.toBe(assets(other).at(-1));
+    await rm(path.join(dir, "other.marko"));
+    await waitFor(
+      async () => !server.bundler.pages.has(path.join(dir, "other.marko")),
+    );
+    expect((await get("/other")).status).toBe(404);
+  });
+});
+
+describe("bundled files", () => {
+  let dir: string;
+  let server: ServeDir;
+  const get = (pathname: string, init?: RequestInit) =>
+    fetch(server.url + pathname, { redirect: "manual", ...init });
+
+  beforeAll(async () => {
+    dir = await createSite();
+    server = await start(dir);
+  });
+  afterAll(() => server.stop());
 
   test("lists the bundled files", async () => {
     const redirect = await get("/_svdr");
@@ -305,22 +351,30 @@ describe("development", () => {
     );
   });
 
-  test("ships no script for pages without client side behavior", async () => {
-    const html = await (await get("/about.marko")).text();
-    expect(html).toContain("<h1>About</h1>");
-    expect(bundledUrls(html)).toEqual([]);
+  test("keeps unchanged server modules across builds", async () => {
+    const index = path.join(dir, "index.marko");
+    const about = path.join(dir, "about.marko");
+    const before = server.bundler.pages.get(index)!.template;
+    await writeFile(about, "<h1>About</h1>\n<p>Changed again</p>\n");
+    await waitFor(async () =>
+      (await (await get("/about")).text()).includes("Changed again"),
+    );
+    // The page that did not change was not loaded again.
+    expect(server.bundler.pages.get(index)!.template).toBe(before!);
   });
+});
 
-  test("compresses with the preferred encoding the client accepts", async () => {
-    const page = await get("/", { headers: { "accept-encoding": "gzip" } });
-    expect(page.headers.get("content-encoding")).toBe("gzip");
-    expect(await page.text()).toContain("<h1>Hello from svdr</h1>");
+describe("watching", () => {
+  let dir: string;
+  let server: ServeDir;
+  const get = (pathname: string, init?: RequestInit) =>
+    fetch(server.url + pathname, { redirect: "manual", ...init });
 
-    const identity = await get("/", {
-      headers: { "accept-encoding": "identity" },
-    });
-    expect(identity.headers.get("content-encoding")).toBeNull();
+  beforeAll(async () => {
+    dir = await createSite();
+    server = await start(dir);
   });
+  afterAll(() => server.stop());
 
   test("rebundles when a dependency changes", async () => {
     await writeFile(

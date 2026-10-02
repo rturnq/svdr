@@ -1,0 +1,106 @@
+import { stripVTControlCharacters } from "node:util";
+import {
+  compress,
+  isCompressible,
+  negotiate,
+  type Encoding,
+} from "./compression.ts";
+
+/** Bodies smaller than this are not worth compressing. */
+const minCompressSize = 1024;
+const maxCompressCacheSize = 128 * 1024 * 1024;
+
+export type Send = (
+  req: Request,
+  body: Uint8Array,
+  headers: Headers,
+  cacheKey: string,
+) => Response;
+
+/**
+ * Creates the function that sends complete bodies, compressed when the
+ * client and the content allow it. Compressed bodies are cached by the
+ * given key, which must change whenever the body does.
+ */
+export function createSend(options: {
+  compression: readonly Encoding[];
+  prod: boolean;
+}): Send {
+  const cache = new CompressionCache(maxCompressCacheSize);
+
+  return (req, body, headers, cacheKey) => {
+    let encoding: Encoding | null = null;
+    if (
+      body.byteLength >= minCompressSize &&
+      isCompressible(headers.get("content-type") ?? "")
+    ) {
+      headers.append("vary", "accept-encoding");
+      encoding = negotiate(
+        req.headers.get("accept-encoding"),
+        options.compression,
+      );
+    }
+    if (encoding) {
+      const key = `${encoding}\0${cacheKey}`;
+      body = cache.get(key, () => compress(encoding, body, options.prod));
+      headers.set("content-encoding", encoding);
+    }
+    headers.set("content-length", String(body.byteLength));
+    return new Response(req.method === "HEAD" ? null : (body as BodyInit), {
+      headers,
+    });
+  };
+}
+
+/** Keeps compressed bodies around, evicting the oldest once over the size limit. */
+class CompressionCache {
+  #entries = new Map<string, Uint8Array>();
+  #size = 0;
+  #maxSize: number;
+
+  constructor(maxSize: number) {
+    this.#maxSize = maxSize;
+  }
+
+  get(key: string, create: () => Uint8Array): Uint8Array {
+    let body = this.#entries.get(key);
+    if (!body) {
+      body = create();
+      this.#entries.set(key, body);
+      this.#size += body.byteLength;
+      for (const [oldKey, oldBody] of this.#entries) {
+        if (this.#size <= this.#maxSize) break;
+        this.#entries.delete(oldKey);
+        this.#size -= oldBody.byteLength;
+      }
+    }
+    return body;
+  }
+}
+
+export function notFound(): Response {
+  return new Response("Not Found", { status: 404 });
+}
+
+export function redirectToDirectory(url: URL): Response {
+  return new Response(null, {
+    status: 308,
+    headers: { location: `${url.pathname}/${url.search}` },
+  });
+}
+
+const stackFrameReg = /^\s+at (?:.+ \(.+\)|(?:\/|file:|node:|native).*)$/;
+
+/** Describes an error, by default without the stack frames that are part of its message. */
+export function errorMessage(error: unknown, stack = false): string {
+  const { message, stack: trace } = error as Error;
+  const text = stripVTControlCharacters(
+    String((stack && trace) || message || error),
+  );
+  if (stack) return text;
+  return text
+    .split("\n")
+    .filter((line) => !stackFrameReg.test(line))
+    .join("\n")
+    .trim();
+}

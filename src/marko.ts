@@ -78,8 +78,17 @@ export async function loadMarko(dir: string): Promise<MarkoToolchain> {
 }
 
 /**
- * The compiler initializes parts of itself during the first compile, which
- * fails when the first compiles are started concurrently by the bundler.
+ * Compiles two trivial templates so that the compiler has initialized itself
+ * before the bundler starts compiling.
+ *
+ * Without this, the first compiles fail under Bun with "Cannot access 'v'
+ * before initialization" from Babel's `validateBrowsers`, when Rolldown calls
+ * the plugin's `load` hook for several templates at once. Babel initializes
+ * the module in question lazily on first use, and starting that from
+ * concurrent hook callbacks trips over the half-initialized module. Plain
+ * concurrent `compile` calls outside of Rolldown do not reproduce it, so the
+ * interaction with Rolldown's native-to-JS callbacks is suspected; seen with
+ * Bun 1.4.2, Rolldown 1.2.12 and @marko/compiler 5.42.10.
  */
 async function warmUp(marko: MarkoToolchain) {
   for (const output of ["html", "dom"] as const) {

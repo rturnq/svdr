@@ -41,7 +41,8 @@ URL paths map directly to files in the directory:
 - `/about/` is a directory. It serves the first of `about/index.marko` and
   `about/index.html` that exists, again following `--extensions`.
 
-Dotfiles and `tags` directories are never served.
+Dotfiles, `node_modules` and `tags` directories, at any level, are never
+served.
 
 ## Pages
 
@@ -91,6 +92,10 @@ appended to them as they are served.
 ## Development
 
 ```sh
-bun test
-bun run typecheck
+bun install
+bun run check   # formatting, types and tests
+bun run format
 ```
+
+`test/fixture/` is a copy of `example/` that the tests build and serve, kept
+separate so that trying things out in the example cannot break them.
