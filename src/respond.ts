@@ -82,10 +82,14 @@ export function notFound(): Response {
   return new Response("Not Found", { status: 404 });
 }
 
-export function redirectToDirectory(url: URL): Response {
+/** Redirects to a path on this server; a path that is not root-relative is made so. */
+export function redirectToDirectory(
+  pathname: string,
+  search: string,
+): Response {
   return new Response(null, {
     status: 308,
-    headers: { location: `${url.pathname}/${url.search}` },
+    headers: { location: `/${pathname.replace(/^\/+/, "")}${search}` },
   });
 }
 

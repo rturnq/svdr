@@ -111,6 +111,43 @@ describe("static files", () => {
     expect((await get("/assets/hello.txt/")).status).toBe(404);
   });
 
+  test("judges files by their own path, not the requested spelling", async () => {
+    // On a case-insensitive file system these reach excluded files.
+    expect((await get("/TAGS/counter.MARKO")).status).toBe(404);
+    expect((await get("/.SECRET")).status).toBe(404);
+    // A page is still a page, and a file still a file.
+    const page = await get("/Index.MARKO");
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain("<h1>Hello from svdr</h1>");
+    expect((await get("/ASSETS/hello.TXT")).status).toBe(200);
+  });
+
+  test("does not resolve segments that appear once decoded", async () => {
+    // Dot segments in the URL itself are resolved by the URL parser, within
+    // the root, before the path is seen; these only appear after decoding.
+    expect((await get("/assets/./hello.txt")).status).toBe(200);
+    for (const pathname of [
+      "//attacker.invalid/%2e%2e%2fassets",
+      "/assets/%2e%2e%2fassets/hello.txt",
+      "/assets/.%2fhello.txt",
+      "/assets//hello.txt",
+    ]) {
+      expect((await get(pathname)).status).toBe(404);
+    }
+  });
+
+  test("only answers requests for this machine", async () => {
+    for (const host of ["localhost", "127.0.0.1", "app.localhost"]) {
+      expect(
+        (await get("/assets/hello.txt", { headers: { host } })).status,
+      ).toBe(200);
+    }
+    const res = await get("/assets/hello.txt", {
+      headers: { host: "attacker.invalid" },
+    });
+    expect(res.status).toBe(403);
+  });
+
   test("only allows reads", async () => {
     expect((await get("/", { method: "POST" })).status).toBe(405);
   });

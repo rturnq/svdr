@@ -42,7 +42,9 @@ URL paths map directly to files in the directory:
   `about/index.html` that exists, again following `--extensions`.
 
 Dotfiles, `node_modules` and `tags` directories, at any level, are never
-served.
+served. These rules apply to the file's own path, so a different spelling of
+it on a case-insensitive file system or a symlink to it makes no difference.
+Requests that name a host other than this machine are refused.
 
 ## Pages
 

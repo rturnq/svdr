@@ -154,15 +154,27 @@ export async function serveDir(
       { status: 500, headers: { "content-type": "text/plain; charset=utf-8" } },
     );
 
-  /** Serves the file at the path if there is one, and it is within the directory. */
+  /**
+   * Serves the file at the path if there is one. What may be served, and
+   * how, is decided by the file's own path: the requested one may spell it
+   * differently on a case-insensitive file system or reach it through a
+   * symlink.
+   */
   const serve = async (req: Request, candidate: string) => {
     const stats = await stat(candidate).catch(() => null);
     if (!stats?.isFile()) return null;
-    const real = await realpath(candidate);
-    if (!real.startsWith(root + path.sep)) return notFound();
-    return candidate.endsWith(markoExt)
-      ? servePage(req, candidate)
-      : serveFile(req, candidate, stats.size, stats.mtime, staticOptions);
+    const file = await realpath(candidate);
+    const relativePath = relative(file);
+    if (
+      relativePath.startsWith("..") ||
+      path.isAbsolute(relativePath) ||
+      !isServable(relativePath)
+    ) {
+      return notFound();
+    }
+    return file.endsWith(markoExt)
+      ? servePage(req, file)
+      : serveFile(req, file, stats.size, stats.mtime, staticOptions);
   };
 
   const fetch = async (req: Request, server: Bun.Server<undefined>) => {
@@ -174,11 +186,29 @@ export async function serveDir(
     }
 
     const url = new URL(req.url);
+    // Only the machine itself is served, so a request addressed to another
+    // host comes from somewhere it should not.
+    if (!isLoopbackHost(url.hostname)) {
+      return new Response("Forbidden", { status: 403 });
+    }
+
     let pathname: string;
     try {
       pathname = decodeURIComponent(url.pathname);
     } catch {
       return new Response("Bad Request", { status: 400 });
+    }
+    // A path is taken as it is: no empty, `.` or `..` segments to resolve.
+    const segments = pathname.split("/").slice(1);
+    if (
+      segments.some(
+        (segment, i) =>
+          segment === "." ||
+          segment === ".." ||
+          (segment === "" && i !== segments.length - 1),
+      )
+    ) {
+      return notFound();
     }
 
     if (hot && pathname === wsPath) {
@@ -200,7 +230,9 @@ export async function serveDir(
       );
     }
     if (pathname === assetsPrefix) return serveListing(req);
-    if (pathname + "/" === assetsPrefix) return redirectToDirectory(url);
+    if (pathname + "/" === assetsPrefix) {
+      return redirectToDirectory(assetsPrefix, url.search);
+    }
     if (pathname.startsWith(assetsPrefix)) return serveAsset(req, pathname);
 
     const file = path.join(root, pathname);
@@ -233,7 +265,7 @@ export async function serveDir(
     }
 
     if ((await stat(file).catch(() => null))?.isDirectory()) {
-      return redirectToDirectory(url);
+      return redirectToDirectory(`${url.pathname}/`, url.search);
     }
     return notFound();
   };
@@ -310,6 +342,16 @@ export async function serveDir(
       await bundler.close();
     },
   };
+}
+
+/** Whether a host name, as a URL has it, is this machine. */
+function isLoopbackHost(hostname: string) {
+  return (
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname === "127.0.0.1" ||
+    hostname === "[::1]"
+  );
 }
 
 /**
