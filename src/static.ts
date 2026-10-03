@@ -44,7 +44,16 @@ export async function serveFile(
   }
   headers.set("accept-ranges", "bytes");
 
-  const range = req.headers.get("range");
+  // A range of the current version only: an entity tag is weak and never
+  // matches, a date matches when it is the modification time.
+  const ifRange = req.headers.get("if-range");
+  const range =
+    ifRange === null ||
+    (!ifRange.startsWith("W/") &&
+      !ifRange.startsWith('"') &&
+      Date.parse(ifRange) === Math.floor(mtime.getTime() / 1000) * 1000)
+      ? req.headers.get("range")
+      : null;
   if (range) {
     const parsed = parseRange(range, size);
     if (parsed === null) {

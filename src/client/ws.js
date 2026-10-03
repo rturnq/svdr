@@ -35,10 +35,10 @@ function swapStyles({ styles, files }) {
   for (const link of document.querySelectorAll('link[rel~="stylesheet"]')) {
     const current = new URL(link.href);
     if (current.origin !== location.origin) continue;
-    const path = decodeURI(current.pathname);
+    const path = current.pathname.split("/").map(decodeURIComponent).join("/");
     const replaced = styles.find(([from]) => from === path);
     if (replaced) {
-      swap(link, encodeURI(replaced[1]));
+      swap(link, replaced[1].split("/").map(encodeURIComponent).join("/"));
     } else if (files.includes(path)) {
       // The URL stays the same, so the query is what makes the browser fetch it again.
       swap(link, current.pathname + "?v=" + Date.now());
@@ -49,8 +49,13 @@ function swapStyles({ styles, files }) {
 function swap(link, href) {
   const next = link.cloneNode();
   next.href = href;
-  // The old stylesheet stays until the new one is ready to avoid a flash of unstyled content.
-  next.onload = next.onerror = () => link.remove();
+  // The old stylesheet stays until the new one is ready, to avoid a flash of
+  // unstyled content, and for good if the new one cannot be loaded.
+  next.onload = () => link.remove();
+  next.onerror = () => {
+    next.remove();
+    console.error("[svdr] Failed to load the stylesheet " + href);
+  };
   link.after(next);
 }
 

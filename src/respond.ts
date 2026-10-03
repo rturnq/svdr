@@ -15,7 +15,7 @@ export type Send = (
   body: Uint8Array,
   headers: Headers,
   cacheKey: string,
-) => Response;
+) => Promise<Response>;
 
 /**
  * Creates the function that sends complete bodies, compressed when the
@@ -28,7 +28,7 @@ export function createSend(options: {
 }): Send {
   const cache = new CompressionCache(maxCompressCacheSize);
 
-  return (req, body, headers, cacheKey) => {
+  return async (req, body, headers, cacheKey) => {
     let encoding: Encoding | null = null;
     if (
       body.byteLength >= minCompressSize &&
@@ -42,7 +42,7 @@ export function createSend(options: {
     }
     if (encoding) {
       const key = `${encoding}\0${cacheKey}`;
-      body = cache.get(key, () => compress(encoding, body, options.prod));
+      body = await cache.get(key, () => compress(encoding, body, options.prod));
       headers.set("content-encoding", encoding);
     }
     headers.set("content-length", String(body.byteLength));
@@ -52,9 +52,14 @@ export function createSend(options: {
   };
 }
 
-/** Keeps compressed bodies around, evicting the oldest once over the size limit. */
+/**
+ * Keeps compressed bodies around, evicting the oldest once over the size
+ * limit. A body that is being compressed is only compressed once, however
+ * many requests ask for it meanwhile.
+ */
 class CompressionCache {
   #entries = new Map<string, Uint8Array>();
+  #pending = new Map<string, Promise<Uint8Array>>();
   #size = 0;
   #maxSize: number;
 
@@ -62,19 +67,29 @@ class CompressionCache {
     this.#maxSize = maxSize;
   }
 
-  get(key: string, create: () => Uint8Array): Uint8Array {
-    let body = this.#entries.get(key);
-    if (!body) {
-      body = create();
-      this.#entries.set(key, body);
-      this.#size += body.byteLength;
-      for (const [oldKey, oldBody] of this.#entries) {
-        if (this.#size <= this.#maxSize) break;
-        this.#entries.delete(oldKey);
-        this.#size -= oldBody.byteLength;
-      }
+  get(key: string, create: () => Promise<Uint8Array>): Promise<Uint8Array> {
+    const body = this.#entries.get(key);
+    if (body) return Promise.resolve(body);
+    let pending = this.#pending.get(key);
+    if (!pending) {
+      pending = create().then((body) => {
+        this.#add(key, body);
+        return body;
+      });
+      this.#pending.set(key, pending);
+      pending.finally(() => this.#pending.delete(key)).catch(() => {});
     }
-    return body;
+    return pending;
+  }
+
+  #add(key: string, body: Uint8Array) {
+    this.#entries.set(key, body);
+    this.#size += body.byteLength;
+    for (const [oldKey, oldBody] of this.#entries) {
+      if (this.#size <= this.#maxSize) break;
+      this.#entries.delete(oldKey);
+      this.#size -= oldBody.byteLength;
+    }
   }
 }
 

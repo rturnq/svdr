@@ -1,4 +1,5 @@
-import { Readable } from "node:stream";
+import { pipeline, Readable } from "node:stream";
+import { promisify } from "node:util";
 import zlib from "node:zlib";
 
 export type Encoding = "br" | "gzip" | "zstd" | "deflate";
@@ -76,46 +77,52 @@ export function isCompressible(contentType: string): boolean {
   return compressibleTypeReg.test(contentType);
 }
 
+const brotliCompress = promisify(zlib.brotliCompress);
+const gzip = promisify(zlib.gzip);
+const zstdCompress = promisify(zlib.zstdCompress);
+const deflate = promisify(zlib.deflate);
+
 /**
- * Compresses a complete body. `best` trades speed for size and is meant for
- * bodies that are compressed once and served many times.
+ * Compresses a complete body off the main thread. `best` trades speed for
+ * size and is meant for bodies that are compressed once and served many
+ * times.
  */
 export function compress(
   encoding: Encoding,
   data: Uint8Array,
   best = false,
-): Uint8Array {
+): Promise<Uint8Array> {
   switch (encoding) {
     case "br":
-      return zlib.brotliCompressSync(data, {
+      return brotliCompress(data, {
         params: {
           [zlib.constants.BROTLI_PARAM_QUALITY]: best ? 11 : 4,
           [zlib.constants.BROTLI_PARAM_SIZE_HINT]: data.byteLength,
         },
       });
     case "gzip":
-      return zlib.gzipSync(data, { level: best ? 9 : 6 });
+      return gzip(data, { level: best ? 9 : 6 });
     case "zstd":
-      return zlib.zstdCompressSync(data, {
+      return zstdCompress(data, {
         params: { [zlib.constants.ZSTD_c_compressionLevel]: best ? 19 : 3 },
       });
     case "deflate":
-      return zlib.deflateSync(data, { level: best ? 9 : 6 });
+      return deflate(data, { level: best ? 9 : 6 });
   }
 }
 
 /**
  * Compresses a streamed body, flushing after every chunk so that content
- * the page flushes early still reaches the browser early.
+ * the page flushes early still reaches the browser early. Cancelling the
+ * result cancels the body, so that a client that went away stops the
+ * rendering it was waiting for.
  */
 export function compressStream(
   encoding: Encoding,
   body: ReadableStream<Uint8Array>,
 ): ReadableStream<Uint8Array> {
   const compressor = createCompressor(encoding);
-  Readable.fromWeb(body as never)
-    .on("error", (err) => compressor.destroy(err))
-    .pipe(compressor);
+  pipeline(Readable.fromWeb(body as never), compressor, () => {});
   return Readable.toWeb(compressor) as never;
 }
 

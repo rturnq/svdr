@@ -2,6 +2,7 @@ import { mkdtemp, readdir, realpath, rm, stat, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { rolldown, type OutputChunk } from "rolldown";
+import { minifyCss, type Stylesheet } from "./css.ts";
 import type { MarkoToolchain } from "./marko.ts";
 import { isIgnored, isTagsPath } from "./paths.ts";
 import {
@@ -23,6 +24,12 @@ const scriptType = "text/javascript; charset=utf-8";
 
 const markoExt = ".marko";
 const taglibFileReg = /(?:^|[\\/])marko(?:-tag)?\.json$/;
+/**
+ * Files the compiler picks up by convention when they exist next to a
+ * template: `style.css` in a tag directory and `<name>.style.css` beside
+ * `<name>.marko`. Adding or removing one changes what a template imports.
+ */
+const conventionFileReg = /(?:^|[\\/])(?:[^\\/]+\.)?style\.\w+$/;
 
 export interface Asset {
   body: Uint8Array;
@@ -142,7 +149,9 @@ export class Bundler {
       const isBundled = (changedPath: string) =>
         // Any template may be a tag that is (or now could be) used by a page.
         changedPath.endsWith(markoExt) ||
+        path.basename(changedPath) === "package.json" ||
         taglibFileReg.test(changedPath) ||
+        conventionFileReg.test(changedPath) ||
         previousDeps.has(changedPath) ||
         this.#deps.has(changedPath);
       let stale =
@@ -260,9 +269,22 @@ export class Bundler {
   async #bundle(files: string[], outDir: string) {
     const { root, marko, prod } = this.#opts;
     const assetIds: AssetIds = { page: new Map(), load: new Map() };
-    const css = new Map<string, string>();
+    const css = new Map<
+      string,
+      Pick<Stylesheet, "css" | "hasImports" | "fileName">
+    >();
     const imports = new Map<string, ModuleImports>();
     const deps = new Set(files);
+    const assets = new Map<string, Asset>();
+    const serverFiles = new Set<string>();
+    const now = new Date();
+    const emit: Emit = (fileName, body, type) => {
+      const url = assetsPrefix + fileName;
+      // The name of a file includes a hash of its content, so a file that
+      // is already there has not changed.
+      const updated = this.#assets.get(url)?.updated ?? now;
+      assets.set(url, { body, type, updated });
+    };
     const plugins = markoPlugins({
       root,
       marko,
@@ -270,6 +292,7 @@ export class Bundler {
       assetIds,
       css,
       imports,
+      emitFile: emit,
     });
     // Entries are named after their path so their names are unique.
     const toInput = (entryIds: string[]) =>
@@ -290,16 +313,6 @@ export class Bundler {
       platform: "node",
       plugins: [plugins.server],
     });
-    const assets = new Map<string, Asset>();
-    const serverFiles = new Set<string>();
-    const now = new Date();
-    const emit: Emit = (fileName, body, type) => {
-      const url = assetsPrefix + fileName;
-      // The name of a file includes a hash of its content, so a file that
-      // is already there has not changed.
-      const updated = this.#assets.get(url)?.updated ?? now;
-      assets.set(url, { body, type, updated });
-    };
     let serverChunks: OutputChunk[];
     try {
       const { output } = await serverBuild.write({
@@ -384,24 +397,37 @@ export class Bundler {
       assetIds,
       emit,
       this.#opts.script,
+      prod,
     );
-    const pages = await Promise.all(
-      serverChunks.map(async (chunk): Promise<Page | undefined> => {
+    // Loading is part of the build: a page that fails to load fails the
+    // build, so that the last working build keeps being served.
+    const loaded = await Promise.all(
+      serverChunks.map(async (chunk) => {
         const entry = chunk.isEntry && parseEntryId(chunk.facadeModuleId ?? "");
         if (!entry) return;
         try {
           const server = await import(path.join(outDir, chunk.fileName));
-          // All pages share the module the assets are registered with.
-          server[registerAssetsExport](manifest);
-          return { file: entry.file, template: server.default };
+          return { file: entry.file, server };
         } catch (error) {
-          return { file: entry.file, error: error as Error };
+          throw new Error(
+            `Failed to load ${path.relative(root, entry.file)}: ${(error as Error).message}`,
+            { cause: error },
+          );
         }
       }),
     );
+    // The pages share the module the assets are registered with, and so may
+    // the pages of the last build. Nothing is registered until every page
+    // has loaded, so a failed build does not change what they link to.
+    const pages: Page[] = [];
+    for (const page of loaded) {
+      if (!page) continue;
+      page.server[registerAssetsExport](manifest);
+      pages.push({ file: page.file, template: page.server.default });
+    }
 
     return {
-      pages: pages.filter((page) => page !== undefined),
+      pages,
       assets,
       styleKeys,
       deps,
@@ -418,6 +444,81 @@ export class Bundler {
  */
 async function createOutDir() {
   return mkdtemp(path.join(await realpath(os.tmpdir()), "svdr-"));
+}
+
+/**
+ * Splits the styles up into stylesheets the way scripts are split up into
+ * chunks: styles used by the same entries share a stylesheet, so that pages
+ * share stylesheets just like they share chunks. A stylesheet is only
+ * shared when every entry that uses it has its styles together and in the
+ * same order, so that the cascade is the same as with one stylesheet per
+ * style.
+ */
+function groupStyles(entries: { styleIds: string[] }[]): string[][] {
+  const users = new Map<string, number[]>();
+  entries.forEach(({ styleIds }, index) => {
+    for (const id of styleIds) {
+      const indexes = users.get(id);
+      if (indexes) indexes.push(index);
+      else users.set(id, [index]);
+    }
+  });
+
+  const groups = new Map<number, string[]>();
+  const groupOf = new Map<string, number>();
+  let nextGroup = 0;
+  const createGroup = (ids: string[]) => {
+    const group = nextGroup++;
+    groups.set(group, ids);
+    for (const id of ids) groupOf.set(id, group);
+    return group;
+  };
+  const byKey = new Map<string, number>();
+  for (const [id, indexes] of users) {
+    const key = indexes.join(",");
+    let group = byKey.get(key);
+    if (group === undefined) byKey.set(key, (group = createGroup([])));
+    groups.get(group)!.push(id);
+    groupOf.set(id, group);
+  }
+
+  // Split a group as long as some entry has its styles apart or in another
+  // order. Every split makes more groups, so this ends.
+  let split = true;
+  while (split) {
+    split = false;
+    for (const { styleIds } of entries) {
+      const runs = new Map<number, string[][]>();
+      let last: number | undefined;
+      for (const id of styleIds) {
+        const group = groupOf.get(id)!;
+        if (group !== last) {
+          runs.set(group, [...(runs.get(group) ?? []), []]);
+          last = group;
+        }
+        runs.get(group)!.at(-1)!.push(id);
+      }
+      for (const [group, groupRuns] of runs) {
+        const ids = groups.get(group)!;
+        if (
+          groupRuns.length === 1 &&
+          groupRuns[0]!.every((id, i) => id === ids[i])
+        ) {
+          continue;
+        }
+        groups.delete(group);
+        for (const run of groupRuns) createGroup(run);
+        split = true;
+      }
+      if (split) break;
+    }
+  }
+  return [...groups.values()];
+}
+
+/** Encodes the URL path of a bundled file, segment by segment. */
+export function assetUrl(pathname: string): string {
+  return pathname.split("/").map(encodeURIComponent).join("/");
 }
 
 /** Whether a chunk has no code of its own and does not load any other chunk. */
@@ -465,14 +566,15 @@ function diff(
  */
 function createManifest(
   chunks: OutputChunk[],
-  css: Map<string, string>,
+  css: Map<string, Pick<Stylesheet, "css" | "hasImports" | "fileName">>,
   imports: Map<string, ModuleImports>,
   assetIds: AssetIds,
   emit: Emit,
   script: string | undefined,
+  minify: boolean,
 ): { manifest: AssetManifest; styleKeys: Map<string, string> } {
   const chunksByName = new Map(chunks.map((chunk) => [chunk.fileName, chunk]));
-  const toUrl = (fileName: string) => encodeURI(assetsPrefix + fileName);
+  const toUrl = (fileName: string) => assetUrl(assetsPrefix + fileName);
   const manifest: AssetManifest = {};
 
   /** The styles a module needs, each after the styles of the modules it imports. */
@@ -515,67 +617,51 @@ function createManifest(
     styleIds: string[];
     isPage: boolean;
   }[] = [];
-  const pageEntries: [file: string, chunk: OutputChunk][] = [];
-  const lazyStyleIds = new Set<string>();
 
   for (const chunk of chunks) {
     const entry = chunk.isEntry && parseEntryId(chunk.facadeModuleId ?? "");
     if (!entry) continue;
-    if (entry.kind === "client") {
-      pageEntries.push([entry.file, chunk]);
-      continue;
-    }
-
-    const assetId = assetIds.load.get(entry.file);
+    const isPage = entry.kind === "client";
+    const assetId = (isPage ? assetIds.page : assetIds.load).get(entry.file);
     if (!assetId) continue;
+    // Styles behind a dynamic import are written with the page as well:
+    // nothing else would load them when the import happens.
     const styleIds = collectStyles(chunk.facadeModuleId!, true);
-    for (const id of styleIds) lazyStyleIds.add(id);
-    entries.push({ assetId, chunk, styleIds, isPage: false });
+    entries.push({ assetId, chunk, styleIds, isPage });
   }
 
-  for (const [file, chunk] of pageEntries) {
-    const assetId = assetIds.page.get(file);
-    if (!assetId) continue;
-    const loaded = new Set(collectStyles(chunk.facadeModuleId!, false));
-    // Styles that are not written with a lazily loaded template belong to
-    // the page, even when their script is only loaded on demand.
-    const styleIds = collectStyles(chunk.facadeModuleId!, true).filter(
-      (id) => loaded.has(id) || !lazyStyleIds.has(id),
-    );
-    entries.push({ assetId, chunk, styleIds, isPage: true });
-  }
-
-  // Like scripts, styles are split up by which entries use them, so that
-  // pages share stylesheets just like they share chunks.
-  const users = new Map<string, string[]>();
-  for (const { assetId, styleIds } of entries) {
-    for (const id of styleIds) {
-      const assetIds = users.get(id);
-      if (assetIds) assetIds.push(assetId);
-      else users.set(id, [assetId]);
-    }
-  }
-  const groups = new Map<string, string[]>();
-  for (const [id, assetIds] of users) {
-    const key = assetIds.join("\0");
-    const group = groups.get(key);
-    if (group) group.push(id);
-    else groups.set(key, [id]);
-  }
   const styles = new Map<string, AssetTag>();
   const styleKeys = new Map<string, string>();
-  for (const ids of groups.values()) {
-    const body = Buffer.from(
-      ids
-        .map((id) => css.get(id)!.trim())
-        .filter(Boolean)
-        .join("\n"),
-    );
-    if (!body.length) continue;
+  // An import-bearing stylesheet keeps its own link and source order. Joining
+  // it to another sheet would either invalidate its imports or move them ahead
+  // of preceding rules and layer declarations.
+  const groups: string[][] = [];
+  for (const ids of groupStyles(entries)) {
+    let local: string[] = [];
+    for (const id of ids) {
+      if (css.get(id)!.hasImports) {
+        if (local.length) groups.push(local);
+        groups.push([id]);
+        local = [];
+      } else {
+        local.push(id);
+      }
+    }
+    if (local.length) groups.push(local);
+  }
+  for (const ids of groups) {
     const name = path
       .basename(ids[0]!)
       .replace(/(?:\.marko(?:\.\d+)?)?\.css$/, "");
-    const fileName = `${name}-${Bun.hash(body).toString(36)}.css`;
+    const text = ids
+      .map((id) => css.get(id)!.css.trim())
+      .filter(Boolean)
+      .join("\n");
+    const body = Buffer.from(minify ? minifyCss(text, `${name}.css`) : text);
+    if (!body.length) continue;
+    const fileName =
+      css.get(ids[0]!)!.fileName ??
+      `${name}-${Bun.hash(body).toString(36)}.css`;
     emit(fileName, body, "text/css; charset=utf-8");
     styleKeys.set(assetsPrefix + fileName, ids.join("\0"));
     for (const id of ids) styles.set(id, ["style", toUrl(fileName)]);

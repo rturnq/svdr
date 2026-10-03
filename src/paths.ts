@@ -17,7 +17,8 @@ export function isIgnored(relativePath: string): boolean {
 
 /**
  * A `tags` directory, at any level, holds the custom tags pages are built
- * from. Its templates are not pages and nothing in it is served.
+ * from. Its templates are not pages and are not served; its other files,
+ * such as the images its styles refer to, are.
  */
 export function isTagsPath(relativePath: string): boolean {
   return segments(relativePath).includes("tags");
@@ -25,5 +26,8 @@ export function isTagsPath(relativePath: string): boolean {
 
 /** Whether a request may be answered with the file at this path. */
 export function isServable(relativePath: string): boolean {
-  return !isIgnored(relativePath) && !isTagsPath(relativePath);
+  return (
+    !isIgnored(relativePath) &&
+    !(isTagsPath(relativePath) && relativePath.endsWith(".marko"))
+  );
 }

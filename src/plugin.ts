@@ -1,6 +1,9 @@
+import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { Plugin } from "rolldown";
+import { assetsPrefix, assetUrl } from "./bundler.ts";
+import { bundleStylesheet, type Stylesheet } from "./css.ts";
 import {
   builtinImporter,
   compilerConfig,
@@ -21,6 +24,21 @@ const bareImportReg = /^(?![./\0])(?![a-zA-Z]:[\\/])/;
 const styleReg = /\.(?:css|less|s[ac]ss|styl(?:us)?|pcss|postcss)$/i;
 const staticAssetReg =
   /\.(?:png|jpe?g|gif|webp|avif|svg|ico|bmp|woff2?|ttf|otf|eot|mp[34]|webm|ogg|wav|flac|aac|pdf)$/i;
+
+/**
+ * Whether the package a bare specifier names is installed in a
+ * `node_modules` directory above the given one.
+ */
+export function isPackageInstalled(specifier: string, dir: string): boolean {
+  const name = /^(?:@[^/]+\/)?[^/]+/.exec(specifier)?.[0];
+  if (!name) return false;
+  for (let current = dir; ; current = path.dirname(current)) {
+    if (existsSync(path.join(current, "node_modules", name, "package.json"))) {
+      return true;
+    }
+    if (current === path.dirname(current)) return false;
+  }
+}
 
 /** The export a server bundle exposes to receive the assets of its client bundle. */
 export const registerAssetsExport = "$$registerAssets";
@@ -70,8 +88,10 @@ export interface MarkoPluginOptions {
    * loaded templates (`import ... with { load }`) need an entry of their own.
    */
   assetIds: AssetIds;
-  /** Receives the CSS of every style module the client build encounters, by module id. */
-  css: Map<string, string>;
+  /** Receives every stylesheet the client build encounters, by module id. */
+  css: Map<string, Pick<Stylesheet, "css" | "hasImports" | "fileName">>;
+  /** Adds a file to the bundle, to be served under the assets prefix. */
+  emitFile: (fileName: string, body: Uint8Array, type: string) => void;
   /**
    * Receives what every module of the client build imports, by module id.
    * Style modules leave nothing behind in the bundle, so this is what tells
@@ -90,6 +110,9 @@ export function markoPlugins(opts: MarkoPluginOptions): {
 } {
   const { compiler, translator } = opts.marko;
   const virtualFiles = new Map<string, string>();
+  // Stylesheets are prepared once for both builds, so that the server
+  // renders the same class names the client's stylesheet has.
+  const stylesheets = new Map<string, Promise<Stylesheet>>();
   const baseConfig = {
     ...compilerConfig,
     translator,
@@ -110,24 +133,68 @@ export function markoPlugins(opts: MarkoPluginOptions): {
     },
   };
 
+  /** Serves a file a stylesheet refers to as part of the bundle. */
+  const emitAsset = (file: string) => {
+    let body;
+    try {
+      body = readFileSync(file);
+    } catch {
+      return null;
+    }
+    const ext = path.extname(file);
+    const fileName = `assets/${path.basename(file, ext)}-${Bun.hash(body).toString(36)}${ext}`;
+    opts.emitFile(fileName, body, Bun.file(file).type);
+    return assetUrl(assetsPrefix + fileName);
+  };
+
   const createPlugin = (isServer: boolean): Plugin => {
     const config = {
       ...baseConfig,
       output: isServer ? "html" : "dom",
     } as const;
 
-    const loadStyle = (id: string, code: string) => {
+    const loadStyle = async (
+      context: { addWatchFile(id: string): void },
+      id: string,
+      code: string | undefined,
+    ) => {
       if (!/\.css$/i.test(id)) {
         throw new Error(
           `Unable to bundle ${id}: only plain CSS styles are supported.`,
         );
       }
-      if (/\.module\.css$/i.test(id)) {
-        throw new Error(
-          `Unable to bundle ${id}: CSS modules are not supported.`,
-        );
+      let stylesheet = stylesheets.get(id);
+      if (!stylesheet) {
+        stylesheet = bundleStylesheet({
+          file: id,
+          code,
+          root: opts.root,
+          fallbackDir: path.dirname(builtinImporter),
+          cssModules: /\.module\.css$/i.test(id),
+          assetPrefix: assetsPrefix,
+          minifyAssets: opts.optimize,
+          emitAsset,
+        }).catch((error) => {
+          throw new Error(
+            `Unable to bundle ${id}: ${(error as Error).message}`,
+            {
+              cause: error,
+            },
+          );
+        });
+        stylesheets.set(id, stylesheet);
       }
-      if (!isServer) opts.css.set(id, code);
+      const { css, hasImports, fileName, assets, js, files } = await stylesheet;
+      for (const { fileName, css } of assets) {
+        opts.emitFile(fileName, Buffer.from(css), "text/css; charset=utf-8");
+      }
+      // Nothing of a stylesheet ends up in the scripts, so the files it was
+      // made from would otherwise not count as files the bundle depends on.
+      for (const file of code === undefined ? [id, ...files] : files) {
+        context.addWatchFile(file);
+      }
+      if (!isServer) opts.css.set(id, { css, hasImports, fileName });
+      if (js) return { code: js, moduleType: "js" } as const;
       // Styles are served as stylesheets, so nothing of them ends up in a script.
       return { code: "", moduleType: "js", moduleSideEffects: false } as const;
     };
@@ -166,12 +233,15 @@ export function markoPlugins(opts: MarkoPluginOptions): {
 
         if (bareImportReg.test(source)) {
           // Packages come from the served directory when installed there and
-          // otherwise from the ones that ship with svdr.
+          // otherwise from the ones that ship with svdr. A package that is
+          // installed but does not provide what is asked for is not papered
+          // over with svdr's copy, which may be another version.
           const resolveOptions = { ...options, skipSelf: true };
-          return (
-            (await this.resolve(source, importer, resolveOptions)) ??
-            (await this.resolve(source, builtinImporter, resolveOptions))
-          );
+          const resolved = await this.resolve(source, importer, resolveOptions);
+          if (resolved || isPackageInstalled(source, path.dirname(importer))) {
+            return resolved;
+          }
+          return this.resolve(source, builtinImporter, resolveOptions);
         }
 
         return null;
@@ -182,7 +252,7 @@ export function markoPlugins(opts: MarkoPluginOptions): {
 
         const virtualFile = virtualFiles.get(id);
         if (virtualFile !== undefined) {
-          if (styleReg.test(id)) return loadStyle(id, virtualFile);
+          if (styleReg.test(id)) return loadStyle(this, id, virtualFile);
           return { code: virtualFile, moduleType: "js" };
         }
 
@@ -214,7 +284,9 @@ export function markoPlugins(opts: MarkoPluginOptions): {
           };
         }
 
-        if (styleReg.test(id)) return loadStyle(id, await readFile(id, "utf8"));
+        if (styleReg.test(id)) {
+          return loadStyle(this, id, undefined);
+        }
 
         if (staticAssetReg.test(id)) {
           const relative = path.relative(opts.root, id);

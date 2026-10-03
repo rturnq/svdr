@@ -25,6 +25,7 @@
   },
   "dependencies": {
     "@marko/compiler": "^5.42.10",
+    "lightningcss": "^1.33.0",
     "marko": "^6.4.0",
     "rolldown": "^1.2.12",
     "selfsigned": "^5.5.0"

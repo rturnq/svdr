@@ -100,6 +100,20 @@ describe("static files", () => {
     expect(await res.text()).toBe("plain");
   });
 
+  test("only serves a range of the version the client has", async () => {
+    const full = await get("/assets/hello.txt");
+    const lastModified = full.headers.get("last-modified")!;
+    const etag = full.headers.get("etag")!;
+    const ranged = (ifRange: string) =>
+      get("/assets/hello.txt", {
+        headers: { range: "bytes=0-2", "if-range": ifRange },
+      });
+    expect((await ranged(lastModified)).status).toBe(206);
+    expect((await ranged(new Date(0).toUTCString())).status).toBe(200);
+    // Entity tags are weak and never match.
+    expect((await ranged(etag)).status).toBe(200);
+  });
+
   test("does not serve missing, hidden, node_modules or outside files", async () => {
     await writeFile(path.join(dir, ".secret"), "hidden");
     await mkdir(path.join(dir, "lib/node_modules"), { recursive: true });
@@ -189,12 +203,12 @@ describe("static files", () => {
     expect((await get("/assets/")).status).toBe(404);
   });
 
-  test("does not serve tags directories or treat them as pages", async () => {
+  test("serves files in tags directories, but not their templates", async () => {
     await writeFile(path.join(dir, "tags/note.txt"), "note");
     expect((await get("/tags/counter.marko")).status).toBe(404);
     expect((await get("/tags/counter")).status).toBe(404);
-    expect((await get("/tags/note.txt")).status).toBe(404);
-    expect((await get("/tags")).status).toBe(404);
+    expect(await (await get("/tags/note.txt")).text()).toBe("note");
+    expect((await get("/tags")).status).toBe(308);
     expect([...server.bundler.pages.keys()].sort()).toEqual([
       path.join(dir, "about.marko"),
       path.join(dir, "index.marko"),
@@ -270,6 +284,182 @@ describe("pages", () => {
       headers: { "accept-encoding": "identity" },
     });
     expect(identity.headers.get("content-encoding")).toBeNull();
+  });
+
+  test("rewrites relative references in bundled styles", async () => {
+    await mkdir(path.join(dir, "docs"), { recursive: true });
+    await writeFile(
+      path.join(dir, "docs/styled.marko"),
+      `<p>Styled</p>
+<style>
+  p { background: url(../assets/bg.svg) }
+  i { background: url("img.png") }
+</style>
+`,
+    );
+    const html = await waitFor(async () => {
+      const res = await get("/docs/styled");
+      return res.status === 200 && (await res.text());
+    });
+    const [style] = bundledUrls(html).filter((url) => url.endsWith(".css"));
+    const css = await (await get(style!)).text();
+    expect(css).toContain("url(/assets/bg.svg)");
+    expect(css).toContain('url("/docs/img.png")');
+  });
+
+  test("keeps each page's cascade order when sharing stylesheets", async () => {
+    for (const name of ["ta", "tb", "tc"]) {
+      await writeFile(
+        path.join(dir, `tags/${name}.marko`),
+        `<span class="${name}">${name}</span>\n<style>\n  .m { color: ${name}; }\n</style>\n`,
+      );
+    }
+    const order = async (pathname: string) => {
+      const html = await waitFor(async () => {
+        const res = await get(pathname);
+        return res.status === 200 && (await res.text());
+      });
+      const sheets = bundledUrls(html).filter((url) => url.endsWith(".css"));
+      const css = (
+        await Promise.all(sheets.map(async (url) => (await get(url)).text()))
+      ).join("\n");
+      return ["ta", "tb", "tc"]
+        .map((name) => [name, css.indexOf(`color: ${name}`)] as const)
+        .filter(([, index]) => index >= 0)
+        .sort((a, b) => a[1] - b[1])
+        .map(([name]) => name);
+    };
+    const removed = async (file: string) => {
+      await rm(path.join(dir, file));
+      await waitFor(
+        async () => !server.bundler.pages.has(path.join(dir, file)),
+      );
+    };
+
+    // The order a page gets on its own is the order it keeps when another
+    // page shares some of its stylesheets.
+    await writeFile(path.join(dir, "one.marko"), "<ta/>\n<tc/>\n<tb/>\n");
+    const alone = await order("/one");
+    expect(alone).toHaveLength(3);
+    await writeFile(path.join(dir, "two.marko"), "<ta/>\n<tb/>\n");
+    await waitFor(async () => (await get("/two")).status === 200);
+    expect(await order("/one")).toEqual(alone);
+    const together = await order("/two");
+    expect(together).toHaveLength(2);
+    await removed("one.marko");
+    expect(await order("/two")).toEqual(together);
+
+    await removed("two.marko");
+    for (const name of ["ta", "tb", "tc"]) {
+      await rm(path.join(dir, `tags/${name}.marko`));
+    }
+  });
+
+  test("writes the styles of a dynamically imported template with the page", async () => {
+    await writeFile(
+      path.join(dir, "tags/lazy-tag.marko"),
+      '<span class="lazy">lazy</span>\n<style>\n  .lazy { color: lazyblue; }\n</style>\n',
+    );
+    // One page loads the template lazily through Marko...
+    await writeFile(
+      path.join(dir, "lazy-a.marko"),
+      'import LazyTag from "./tags/lazy-tag.marko" with { load: "idle" };\n<LazyTag/>\n',
+    );
+    // ...and another through an ordinary dynamic import.
+    await writeFile(
+      path.join(dir, "later.js"),
+      'export const later = () => import("./tags/lazy-tag.marko");\n',
+    );
+    await writeFile(
+      path.join(dir, "lazy-b.marko"),
+      'import { later } from "./later.js";\n<button onClick() { later(); }>later</button>\n',
+    );
+    const html = await waitFor(async () => {
+      const res = await get("/lazy-b");
+      return res.status === 200 && (await res.text());
+    });
+    const sheets = bundledUrls(html).filter((url) => url.endsWith(".css"));
+    const css = (
+      await Promise.all(sheets.map(async (url) => (await get(url)).text()))
+    ).join("\n");
+    expect(css).toContain("lazyblue");
+    await Promise.all(
+      ["lazy-a.marko", "lazy-b.marko", "later.js", "tags/lazy-tag.marko"].map(
+        (file) => rm(path.join(dir, file)),
+      ),
+    );
+    await waitFor(
+      async () => !server.bundler.pages.has(path.join(dir, "lazy-b.marko")),
+    );
+  });
+
+  test("links stylesheets of pages with unusual names", async () => {
+    await writeFile(
+      path.join(dir, "hash#page.marko"),
+      "<p>Hash</p>\n<style>\n  p { color: hashred; }\n</style>\n",
+    );
+    const html = await waitFor(async () => {
+      const res = await get("/hash%23page");
+      return res.status === 200 && (await res.text());
+    });
+    const [href] = Array.from(
+      html.matchAll(/<link rel="stylesheet" href="([^"]+)">/g),
+      (match) => match[1]!,
+    );
+    expect(href).toContain("%23");
+    expect(await (await get(href!)).text()).toContain("hashred");
+    await rm(path.join(dir, "hash#page.marko"));
+    await waitFor(
+      async () => !server.bundler.pages.has(path.join(dir, "hash#page.marko")),
+    );
+  });
+
+  test("supports CSS modules in style blocks and files", async () => {
+    await writeFile(
+      path.join(dir, "shared.module.css"),
+      ".shared { color: sharedgreen }\n",
+    );
+    await writeFile(
+      path.join(dir, "modules.marko"),
+      `import shared from "./shared.module.css";
+<style/s>
+  .box { color: boxred }
+  .big { composes: box; font-size: 2em }
+</style>
+<div class=s.box>box</div>
+<div class=s.big>big</div>
+<div class=shared.shared>shared</div>
+`,
+    );
+    const html = await waitFor(async () => {
+      const res = await get("/modules");
+      return res.status === 200 && (await res.text());
+    });
+    const classes = Array.from(
+      html.matchAll(/<div class="?([^">]+)"?>/g),
+      (match) => match[1]!,
+    );
+    expect(classes).toHaveLength(3);
+    const [box, big, shared] = classes as [string, string, string];
+    // Names are unique, and composed names come along.
+    expect(box).not.toBe("box");
+    expect(box).toMatch(/box$/);
+    expect(big.split(" ")).toEqual([expect.stringMatching(/big$/), box]);
+    expect(shared).toMatch(/shared$/);
+    // The stylesheets use the same names.
+    const sheets = bundledUrls(html).filter((url) => url.endsWith(".css"));
+    const css = (
+      await Promise.all(sheets.map(async (url) => (await get(url)).text()))
+    ).join("\n");
+    expect(css).toContain(`.${box} {`);
+    expect(css).toContain(`.${shared} {`);
+    expect(css).toContain("boxred");
+    expect(css).toContain("sharedgreen");
+    await rm(path.join(dir, "modules.marko"));
+    await rm(path.join(dir, "shared.module.css"));
+    await waitFor(
+      async () => !server.bundler.pages.has(path.join(dir, "modules.marko")),
+    );
   });
 
   test("shares chunks between pages", async () => {
@@ -423,6 +613,141 @@ describe("watching", () => {
     );
   });
 
+  test("bundles stylesheets named by convention and follows their changes", async () => {
+    await mkdir(path.join(dir, "tags/card"), { recursive: true });
+    await writeFile(
+      path.join(dir, "tags/card/index.marko"),
+      '<div class="card"><${input.content}/></div>\n',
+    );
+    await writeFile(
+      path.join(dir, "tags/card/style.css"),
+      ".card { border: 1px solid }\n",
+    );
+    await writeFile(path.join(dir, "conv.marko"), "<card>hi</card>\n");
+    const styles = async () => {
+      const html = await waitFor(async () => {
+        const res = await get("/conv");
+        return res.status === 200 && (await res.text());
+      });
+      const sheets = bundledUrls(html).filter((url) => url.endsWith(".css"));
+      return (
+        await Promise.all(sheets.map(async (url) => (await get(url)).text()))
+      ).join("\n");
+    };
+    // `style.css` in a tag directory...
+    expect(await styles()).toContain("border: 1px solid");
+    // ...is followed when it changes...
+    await writeFile(
+      path.join(dir, "tags/card/style.css"),
+      ".card { border: 2px solid }\n",
+    );
+    await waitFor(async () => (await styles()).includes("border: 2px solid"));
+    // ...and `<name>.style.css` is picked up when it appears.
+    await writeFile(path.join(dir, "conv.style.css"), "body { margin: 0 }\n");
+    await waitFor(async () => (await styles()).includes("margin: 0"));
+    await rm(path.join(dir, "conv.style.css"));
+    await waitFor(async () => !(await styles()).includes("margin: 0"));
+  });
+
+  test("inlines imported stylesheets and follows their changes", async () => {
+    await mkdir(path.join(dir, "styles"), { recursive: true });
+    await writeFile(
+      path.join(dir, "styles/theme.css"),
+      ".theme { color: themeblue }\n",
+    );
+    await writeFile(
+      path.join(dir, "imports.marko"),
+      '<p class="theme">t</p>\n<style>\n  @import "./styles/theme.css";\n  p { margin: 0 }\n</style>\n',
+    );
+    const styles = async () => {
+      const html = await waitFor(async () => {
+        const res = await get("/imports");
+        return res.status === 200 && (await res.text());
+      });
+      const sheets = bundledUrls(html).filter((url) => url.endsWith(".css"));
+      return (
+        await Promise.all(sheets.map(async (url) => (await get(url)).text()))
+      ).join("\n");
+    };
+    const css = await styles();
+    expect(css).toContain("themeblue");
+    expect(css).not.toContain("@import");
+    await writeFile(
+      path.join(dir, "styles/theme.css"),
+      ".theme { color: themegreen }\n",
+    );
+    await waitFor(async () => (await styles()).includes("themegreen"));
+    await rm(path.join(dir, "imports.marko"));
+    await waitFor(
+      async () => !server.bundler.pages.has(path.join(dir, "imports.marko")),
+    );
+  });
+
+  test("combines stylesheets with their remote imports first", async () => {
+    await writeFile(
+      path.join(dir, "tags/first.marko"),
+      "<i>f</i>\n<style>\n  .first { color: red }\n</style>\n",
+    );
+    await writeFile(
+      path.join(dir, "tags/second.marko"),
+      '<b>s</b>\n<style>\n  @import "https://fonts.example/f.css";\n  .second { color: blue }\n</style>\n',
+    );
+    await writeFile(path.join(dir, "remote.marko"), "<first/>\n<second/>\n");
+    const html = await waitFor(async () => {
+      const res = await get("/remote");
+      return res.status === 200 && (await res.text());
+    });
+    for (const url of bundledUrls(html).filter((u) => u.endsWith(".css"))) {
+      const css = await (await get(url)).text();
+      const imports = css.match(/@import/g) ?? [];
+      if (imports.length) {
+        expect(css.trimStart().startsWith("@import")).toBe(true);
+        expect(css.indexOf("@import")).toBeLessThan(css.indexOf("{"));
+      }
+    }
+    await rm(path.join(dir, "remote.marko"));
+    await rm(path.join(dir, "tags/first.marko"));
+    await rm(path.join(dir, "tags/second.marko"));
+    await waitFor(
+      async () => !server.bundler.pages.has(path.join(dir, "remote.marko")),
+    );
+  });
+
+  test("serves files that package stylesheets refer to", async () => {
+    await mkdir(path.join(dir, "node_modules/fonts"), { recursive: true });
+    await writeFile(
+      path.join(dir, "node_modules/fonts/package.json"),
+      '{ "name": "fonts", "style": "fonts.css" }',
+    );
+    await writeFile(
+      path.join(dir, "node_modules/fonts/fonts.css"),
+      '@font-face { font-family: F; src: url(./f.woff2) format("woff2") }\n',
+    );
+    await writeFile(path.join(dir, "node_modules/fonts/f.woff2"), "woff2");
+    await writeFile(
+      path.join(dir, "fonts.marko"),
+      '<p>f</p>\n<style>\n  @import "fonts";\n</style>\n',
+    );
+    const html = await waitFor(async () => {
+      const res = await get("/fonts");
+      return res.status === 200 && (await res.text());
+    });
+    const [sheet] = bundledUrls(html).filter((u) => u.endsWith(".css"));
+    const css = await (await get(sheet!)).text();
+    const [, font] =
+      /url\("?(\/_svdr\/assets\/f-[^")]+\.woff2)"?\)/.exec(css) ?? [];
+    expect(font).toBeDefined();
+    const res = await get(font!);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("woff2");
+    expect(await (await get("/_svdr/")).text()).toContain("assets/f-");
+    await rm(path.join(dir, "fonts.marko"));
+    await rm(path.join(dir, "node_modules"), { recursive: true });
+    await waitFor(
+      async () => !server.bundler.pages.has(path.join(dir, "fonts.marko")),
+    );
+  });
+
   test("picks up added and removed pages", async () => {
     const file = path.join(dir, "added.marko");
     await writeFile(file, "<p>Added</p>\n");
@@ -473,6 +798,75 @@ test("keeps serving the last working build while bundling fails", async () => {
       (await text("/about")).includes("<h1>Fixed</h1>"),
     );
     expect(await text("/new")).toContain("<p>New</p>");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("finishes pages that render nothing", async () => {
+  const dir = await createSite();
+  await writeFile(path.join(dir, "empty.marko"), "<if=false>never</if>\n");
+  const server = await start(dir, { hot: false });
+  try {
+    const res = await fetch(server.url + "/empty", {
+      signal: AbortSignal.timeout(2000),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("does not change what the last working build links to when loading fails", async () => {
+  const dir = await createSite();
+  const errors: string[] = [];
+  const server = await start(
+    dir,
+    {},
+    { info() {}, error: (message) => errors.push(message) },
+  );
+  try {
+    const before = await (await fetch(server.url + "/")).text();
+    // A style change together with a dependency that no longer loads.
+    const index = path.join(dir, "index.marko");
+    await writeFile(
+      index,
+      (await Bun.file(index).text()).replace("rebeccapurple", "crimson"),
+    );
+    await writeFile(
+      path.join(dir, "greeting.js"),
+      'throw new Error("boom");\nexport const greeting = () => "";\n',
+    );
+    await waitFor(async () => errors.length > 0);
+    const html = await (await fetch(server.url + "/")).text();
+    expect(html).toBe(before);
+    for (const url of bundledUrls(html)) {
+      expect((await fetch(server.url + url)).status).toBe(200);
+    }
+  } finally {
+    await server.stop();
+  }
+});
+
+test("keeps the last working build when a page fails to load", async () => {
+  const dir = await createSite();
+  const errors: string[] = [];
+  const server = await start(
+    dir,
+    {},
+    { info() {}, error: (message) => errors.push(message) },
+  );
+  try {
+    const before = await (await fetch(server.url + "/")).text();
+    await writeFile(
+      path.join(dir, "greeting.js"),
+      'throw new Error("boom");\nexport const greeting = () => "";\n',
+    );
+    await waitFor(async () => errors.length > 0);
+    expect(errors[0]).toContain("Bundling failed, still serving");
+    expect(errors[0]).toContain("boom");
+    expect(await (await fetch(server.url + "/")).text()).toBe(before);
   } finally {
     await server.stop();
   }
@@ -618,11 +1012,12 @@ describe("live reload", () => {
   });
 
   test("does nothing when nothing a page shows changed", async () => {
-    // Written again as it was, in a tags directory, hidden and removed.
+    // Written again as it was, hidden, under node_modules and removed.
     const file = path.join(dir, "about.marko");
     await writeFile(file, await Bun.file(file).text());
-    await writeFile(path.join(dir, "tags/note.txt"), "note");
     await writeFile(path.join(dir, ".hidden"), "hidden");
+    await mkdir(path.join(dir, "node_modules"), { recursive: true });
+    await writeFile(path.join(dir, "node_modules/dep.js"), "dep");
     await rm(path.join(dir, "assets/hello.txt"));
     await Bun.sleep(400);
     await server.bundler.settled;
@@ -735,6 +1130,12 @@ test("only uses the configured extensions", async () => {
 
 test("production bundles are minified and still watched", async () => {
   const dir = await createSite();
+  // A stylesheet with a remote import after one without must still be valid.
+  await writeFile(
+    path.join(dir, "tags/second.marko"),
+    '<b>s</b>\n<style>\n  @import "https://fonts.example/f.css";\n  .second { color: blue }\n</style>\n',
+  );
+  await writeFile(path.join(dir, "about.marko"), "<counter/>\n<second/>\n");
   const server = await start(dir, { prod: true });
   try {
     const html = await (await fetch(server.url + "/")).text();
@@ -745,6 +1146,13 @@ test("production bundles are minified and still watched", async () => {
     expect(await (await fetch(server.url + script)).text()).not.toContain(
       "\n\t",
     );
+    const sheets = bundledUrls(html).filter((url) => url.endsWith(".css"));
+    expect(sheets.length).toBeGreaterThan(0);
+    for (const url of sheets) {
+      const css = await (await fetch(server.url + url)).text();
+      expect(css).not.toContain("\n");
+      expect(css).not.toContain(": ");
+    }
 
     await writeFile(path.join(dir, "added.marko"), "<p>Added</p>\n");
     await waitFor(

@@ -22,7 +22,7 @@ bun src/cli.ts --dir example
 | `-x`, `--extensions`  | `marko,html`          | Extensions to try, in order, for paths without one and for directory indexes, or `none`. |
 | `-h`, `--hot`         | on, off with `--prod` | Reload pages and swap their styles when files change. `--hot off` turns it off.          |
 | `--http`              |                       | Serve plain HTTP instead of HTTPS.                                                       |
-| `--prod`              |                       | Minified bundles, stronger compression and no source maps.                               |
+| `--prod`              |                       | Minified scripts and stylesheets, stronger compression and no source maps.               |
 | `--help`              |                       | Show the options.                                                                        |
 
 By default the server uses HTTPS with a self-signed certificate that is
@@ -41,8 +41,9 @@ URL paths map directly to files in the directory:
 - `/about/` is a directory. It serves the first of `about/index.marko` and
   `about/index.html` that exists, again following `--extensions`.
 
-Dotfiles, `node_modules` and `tags` directories, at any level, are never
-served. These rules apply to the file's own path, so a different spelling of
+Dotfiles and `node_modules`, at any level, are never served, and neither
+are the templates in `tags` directories; other files in them, such as the
+images their styles refer to, are. These rules apply to the file's own path, so a different spelling of
 it on a case-insensitive file system or a symlink to it makes no difference.
 Requests that name a host other than this machine are refused.
 
@@ -57,7 +58,13 @@ from. All pages are bundled together into
 - a client bundle, which makes the pages interactive in the browser. Code
   and `<style>` blocks used by several pages end up in chunks those pages
   share. Scripts and stylesheets are served from `/_svdr/` and linked
-  from each page automatically.
+  from each page automatically. Local stylesheets a `<style>` block or
+  stylesheet `@import`s are inlined into it (a package's stylesheet can be
+  imported by name). When an import chain includes a remote stylesheet,
+  its local dependencies are served as bundled stylesheets and the import
+  chain is preserved, including its order, conditions, and layers. `url()`
+  references keep pointing at the right files. CSS modules (`<style/styles>` blocks and
+  `.module.css` files) are supported; other style languages are not.
 
 `/_svdr/` itself lists every bundled file with its size and when a build
 last changed it. The files of the server bundle are served for inspection

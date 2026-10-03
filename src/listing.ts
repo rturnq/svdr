@@ -1,4 +1,4 @@
-import { assetsPrefix, type Asset } from "./bundler.ts";
+import { assetsPrefix, assetUrl, type Asset } from "./bundler.ts";
 
 /** Local time in the local language. */
 const dateFormat = new Intl.DateTimeFormat(undefined, {
@@ -13,7 +13,7 @@ export function renderListing(assets: ReadonlyMap<string, Asset>): string {
   const rows = sorted.map(([url, asset]) => {
     const name = url.slice(assetsPrefix.length);
     return (
-      `<tr><td><a href="${Bun.escapeHTML(encodeURI(name))}">${Bun.escapeHTML(name)}</a></td>` +
+      `<tr><td><a href="${Bun.escapeHTML(assetUrl(name))}">${Bun.escapeHTML(name)}</a></td>` +
       `<td class="size">${formatSize(asset.body.length)}</td>` +
       `<td><time datetime="${asset.updated.toISOString()}">${dateFormat.format(asset.updated)}</time></td></tr>`
     );

@@ -363,7 +363,13 @@ async function primed(
 ): Promise<ReadableStream<Uint8Array>> {
   const reader = stream.getReader();
   const first = await reader.read();
-  if (first.done) return new Response(null).body ?? new ReadableStream();
+  if (first.done) {
+    return new ReadableStream({
+      start(controller) {
+        controller.close();
+      },
+    });
+  }
 
   let started = false;
   return new ReadableStream({
