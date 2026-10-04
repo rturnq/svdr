@@ -4,7 +4,7 @@
   "description": "Simple directory server with bundling",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rturnq/serve-dir.git"
+    "url": "git+https://github.com/rturnq/svdr.git"
   },
   "type": "module",
   "bin": {
