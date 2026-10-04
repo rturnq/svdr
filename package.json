@@ -2,6 +2,7 @@
   "name": "svdr",
   "version": "0.0.0",
   "description": "Simple directory server with bundling",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/rturnq/svdr.git"
