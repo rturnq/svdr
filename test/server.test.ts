@@ -16,7 +16,12 @@ import type { WsMessage } from "../src/ws.ts";
 import type { Options } from "../src/options.ts";
 import { serveDir, type Logger, type ServeDir } from "../src/server.ts";
 
-const silent = { info() {}, error() {} };
+/** What the servers of the tests logged, to explain a wait that timed out. */
+const logged: string[] = [];
+const silent = {
+  info: (message: string) => void logged.push(message),
+  error: (message: string) => void logged.push(message),
+};
 const fixture = path.join(import.meta.dir, "fixture");
 const tmpDirs: string[] = [];
 
@@ -55,7 +60,7 @@ async function waitFor<T>(check: () => Promise<T | false | undefined>) {
     if (result) return result;
     await Bun.sleep(25);
   }
-  throw new Error("Timed out");
+  throw new Error(`Timed out. Last logged:\n${logged.slice(-25).join("\n")}`);
 }
 
 const wsScriptUrl = "/_svdr/ws.js";
