@@ -1,9 +1,9 @@
 import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
-import { assetsPrefix, Bundler, type Page } from "./bundler.ts";
+import { assetsPrefix, assetUrl, Bundler, type Page } from "./bundler.ts";
 import { loadCertificate } from "./cert.ts";
 import { compressStream, negotiate } from "./compression.ts";
-import { renderListing } from "./listing.ts";
+import { renderEntries, renderListing } from "./listing.ts";
 import { loadMarko } from "./marko.ts";
 import type { Options } from "./options.ts";
 import { isServable } from "./paths.ts";
@@ -95,9 +95,40 @@ export async function serveDir(
     );
   };
 
-  const serveListing = async (req: Request) => {
+  const pageUrl = async (file: string) => {
+    const exact = assetUrl("/" + file);
+    const index = options.extensions.indexOf("marko");
+    if (index === -1) return exact;
+    const stem = file.slice(0, -markoExt.length);
+    const isIndex = path.basename(file) === "index.marko";
+    // Use the short route only when it resolves to this template rather than
+    // an exact file or an extension with higher priority.
+    const preceding = [
+      ...(isIndex ? [] : [stem]),
+      ...options.extensions.slice(0, index).map((ext) => `${stem}.${ext}`),
+    ];
+    for (const candidate of preceding) {
+      if (
+        (await stat(path.join(root, candidate)).catch(() => null))?.isFile()
+      ) {
+        return exact;
+      }
+    }
+    return assetUrl(
+      "/" + (isIndex ? file.slice(0, -"index.marko".length) : stem),
+    );
+  };
+
+  const serveListing = async (req: Request, prefix = assetsPrefix) => {
     await bundler.settled;
-    const body = Buffer.from(renderListing(bundler.assets));
+    const entries = bundler.entries;
+    const entry = entries.find((entry) => entry.prefix === prefix);
+    if (prefix !== assetsPrefix && !entry) return notFound();
+    const body = Buffer.from(
+      entry
+        ? renderListing(entry, await pageUrl(entry.file))
+        : renderEntries(entries),
+    );
     return send(
       req,
       body,
@@ -105,12 +136,11 @@ export async function serveDir(
         "content-type": "text/html; charset=utf-8",
         "cache-control": "no-cache",
       }),
-      `${assetsPrefix}\0${Bun.hash(body)}`,
+      `${prefix}\0${Bun.hash(body)}`,
     );
   };
 
   const servePage = async (req: Request, file: string) => {
-    await bundler.settled;
     const page = bundler.pages.get(file);
     if (!page) return notFound();
 
@@ -233,7 +263,18 @@ export async function serveDir(
     if (pathname + "/" === assetsPrefix) {
       return redirectToDirectory(assetsPrefix, url.search);
     }
-    if (pathname.startsWith(assetsPrefix)) return serveAsset(req, pathname);
+    if (pathname.startsWith(assetsPrefix)) {
+      // Entry indexes occupy only the first level; nested paths are assets.
+      if (/^[^/]+\/?$/.test(pathname.slice(assetsPrefix.length))) {
+        if (pathname.endsWith("/")) return serveListing(req, pathname);
+        await bundler.settled;
+        const prefix = pathname + "/";
+        if (bundler.entries.some((entry) => entry.prefix === prefix)) {
+          return redirectToDirectory(prefix, url.search);
+        }
+      }
+      return serveAsset(req, pathname);
+    }
 
     const file = path.join(root, pathname);
     const relativePath = relative(file);
@@ -320,6 +361,7 @@ export async function serveDir(
   const watcher = watchDir(root, async (paths) => {
     try {
       const result = await bundler.update(paths);
+      watcher.updateDependencies(bundler.dependencies);
       if (!hot) return;
       const messages = await messagesFor(
         root,
@@ -332,6 +374,8 @@ export async function serveDir(
       log.error(errorMessage(error, true));
     }
   });
+
+  watcher.updateDependencies(bundler.dependencies);
 
   return {
     url: `${tls ? "https" : "http"}://localhost:${port}`,

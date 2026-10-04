@@ -6,8 +6,8 @@
 const segments = (relativePath: string) => relativePath.split(/[\\/]/);
 
 /**
- * Dotfiles and `node_modules`, at any level, are never scanned, watched or
- * served.
+ * Dotfiles and `node_modules` are excluded from page discovery and static
+ * serving. The watcher may still follow explicitly imported dependencies.
  */
 export function isIgnored(relativePath: string): boolean {
   return segments(relativePath).some(

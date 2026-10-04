@@ -29,7 +29,7 @@ export const compilerConfig = {
   },
 } as const;
 
-/** A file inside svdr, used to resolve the packages that ship with it. */
+/** A file inside svdr, used to resolve its bundled Marko runtime. */
 export const builtinImporter = fileURLToPath(import.meta.url);
 
 /**

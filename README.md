@@ -18,7 +18,7 @@ bun src/cli.ts --dir example
 | --------------------- | --------------------- | ---------------------------------------------------------------------------------------- |
 | `-d`, `--dir`         | `.`                   | Directory to serve.                                                                      |
 | `-p`, `--port`        | `3000`                | Port to listen on. Fails when the port is taken.                                         |
-| `-c`, `--compression` | `br,gz`               | Encodings in order of preference: `br`, `gz`, `zstd`, `deflate`, or `none`.              |
+| `-c`, `--compression` | `br,gz`               | Encodings in order of preference: `br`, `gz`, or `none`.                                 |
 | `-x`, `--extensions`  | `marko,html`          | Extensions to try, in order, for paths without one and for directory indexes, or `none`. |
 | `-h`, `--hot`         | on, off with `--prod` | Reload pages and swap their styles when files change. `--hot off` turns it off.          |
 | `--http`              |                       | Serve plain HTTP instead of HTTPS.                                                       |
@@ -52,35 +52,44 @@ Requests that name a host other than this machine are refused.
 Every `.marko` file outside of a `tags` directory is a page: requesting
 `/about` or `/about.marko` renders `about.marko` on the server and streams
 the HTML. Templates in `tags` directories are the custom tags pages are built
-from. All pages are bundled together into
+from. Each page is compiled independently into its own server and client
+bundles. Pages share no generated modules, stylesheets, or imported assets,
+even when they import the same source files. A page's files are served from
+`/_svdr/<hash>/`. The five-character hash comes from the relative `.marko` file path,
+so it stays the same when the file is edited or the playground is moved. Scripts
+and stylesheets are linked from that page automatically, in dependency order.
 
-- a server bundle, which is loaded to render the pages, and
-- a client bundle, which makes the pages interactive in the browser. Code
-  and `<style>` blocks used by several pages end up in chunks those pages
-  share. Scripts and stylesheets are served from `/_svdr/` and linked
-  from each page automatically. Local stylesheets a `<style>` block or
-  stylesheet `@import`s are inlined into it (a package's stylesheet can be
-  imported by name). When an import chain includes a remote stylesheet,
-  its local dependencies are served as bundled stylesheets and the import
-  chain is preserved, including its order, conditions, and layers. `url()`
-  references keep pointing at the right files. CSS modules (`<style/styles>` blocks and
-  `.module.css` files) are supported; other style languages are not.
+Local stylesheet `@import`s are inlined (package stylesheets can be imported
+by name). When an import chain includes a remote stylesheet, local dependencies
+are emitted into the page's asset directory and the import chain is preserved,
+including its order, conditions, and layers. Relative `url()` assets and assets
+imported from JavaScript are also emitted there. Root-relative and remote URLs
+keep their original meaning. CSS Modules (`<style/styles>` blocks and
+`.module.css` files) are supported; other style languages are not.
 
-`/_svdr/` itself lists every bundled file with its size and when a build
-last changed it. The files of the server bundle are served for inspection
-under `/_svdr/server/`. Files that would be empty, such as the script of a
-page without any client side behavior, are not part of the bundle.
+`/_svdr/` lists the Marko entry paths, linking to each entry's hashed directory.
+Each entry directory has its own index listing all of its bundled files, their
+sizes, and when they last changed, with a link back to the entry list. Server
+bundles remain available for inspection under `/_svdr/<hash>/server/`. Empty
+client entries are omitted for pages without client-side behavior.
 
-`marko` and other packages a page imports are resolved from the directory's
-`node_modules` when installed there, and otherwise from the packages that
-ship with svdr, so a bare directory of templates works without
-installing anything. Marko 6 is required.
+Packages resolve from the importing file's `node_modules` ancestors. Only
+`marko` falls back to the runtime shipped with svdr, so a bare directory of
+templates works without installing anything. Other application dependencies
+must be installed by the project. Marko 6 is required.
 
-The directory is watched recursively. When a template or a file that went
-into the bundles changes, the pages are bundled again. When that fails, the
-error is logged and the last working build keeps being served until the
-problem is fixed; only pages that have never been bundled respond with the
-error.
+The directory is watched recursively, along with imported dependencies outside
+it. An edit rebuilds each page whose import graph contains the changed file;
+a shared dependency rebuilds all of its consuming pages. Changes to tag
+discovery or package mappings can require rebuilding other pages too. Independent
+builds run with bounded concurrency and publish as each page finishes. Existing
+pages remain available while builds run.
+
+When an entry fails, its error is logged and its own last working build remains
+available. Other entries can still publish successful builds. Only pages that
+have never built successfully respond with the error. `--prod` keeps the same
+independent build model with minification, stronger compression, and no source
+maps.
 
 ## Live reload
 

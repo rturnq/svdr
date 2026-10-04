@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { cp, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { entryPrefix } from "../src/bundler.ts";
 import type { WsMessage } from "../src/ws.ts";
 import type { Options } from "../src/options.ts";
 import { serveDir, type Logger, type ServeDir } from "../src/server.ts";
@@ -307,7 +308,7 @@ describe("pages", () => {
     expect(css).toContain('url("/docs/img.png")');
   });
 
-  test("keeps each page's cascade order when sharing stylesheets", async () => {
+  test("keeps each page's cascade order when other pages change", async () => {
     for (const name of ["ta", "tb", "tc"]) {
       await writeFile(
         path.join(dir, `tags/${name}.marko`),
@@ -337,7 +338,7 @@ describe("pages", () => {
     };
 
     // The order a page gets on its own is the order it keeps when another
-    // page shares some of its stylesheets.
+    // page uses some of the same source stylesheets.
     await writeFile(path.join(dir, "one.marko"), "<ta/>\n<tc/>\n<tb/>\n");
     const alone = await order("/one");
     expect(alone).toHaveLength(3);
@@ -462,7 +463,7 @@ describe("pages", () => {
     );
   });
 
-  test("shares chunks between pages", async () => {
+  test("isolates chunks between pages", async () => {
     await writeFile(
       path.join(dir, "other.marko"),
       "<h1>Other</h1>\n<counter/>\n",
@@ -475,9 +476,11 @@ describe("pages", () => {
     const assets = bundledUrls;
     const shared = assets(index).filter((url) => assets(other).includes(url));
 
-    expect(shared.some((url) => url.endsWith(".js"))).toBe(true);
-    expect(shared.some((url) => url.endsWith(".css"))).toBe(true);
-    for (const url of shared) expect((await get(url)).status).toBe(200);
+    expect(shared).toEqual([]);
+    for (const url of assets(index))
+      expect(url).toStartWith(entryPrefix(dir, path.join(dir, "index.marko")));
+    for (const url of assets(other))
+      expect(url).toStartWith(entryPrefix(dir, path.join(dir, "other.marko")));
     // Each page still has an entry of its own.
     expect(assets(index).at(-1)).not.toBe(assets(other).at(-1));
     await rm(path.join(dir, "other.marko"));
@@ -500,7 +503,7 @@ describe("bundled files", () => {
   });
   afterAll(() => server.stop());
 
-  test("lists the bundled files", async () => {
+  test("lists entries and their bundled files", async () => {
     const redirect = await get("/_svdr");
     expect(redirect.status).toBe(308);
     expect(redirect.headers.get("location")).toBe("/_svdr/");
@@ -508,7 +511,12 @@ describe("bundled files", () => {
     const res = await get("/_svdr/");
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
-    const listing = await res.text();
+    const entries = await res.text();
+    const prefix = entryPrefix(dir, path.join(dir, "index.marko"));
+    expect(entries).toContain(
+      `href="${prefix.slice("/_svdr/".length)}">index.marko</a>`,
+    );
+    const listing = await (await get(prefix)).text();
     const rows = Array.from(
       listing.matchAll(
         /<a href="([^"]+)">([^<]+)<\/a><\/td><td class="size">([^<]+)<\/td><td><time datetime="([^"]+)">/g,
@@ -516,20 +524,22 @@ describe("bundled files", () => {
       ([, href, name, size, updated]) => ({ href, name, size, updated }),
     );
     // Links are relative to the listing and named by that same path.
-    expect(rows.map((row) => "/_svdr/" + row.href)).toEqual(
-      [...server.bundler.assets.keys()].sort(),
+    expect(rows.map((row) => prefix + row.href)).toEqual(
+      [...server.bundler.assets.keys()]
+        .filter((url) => url.startsWith(prefix))
+        .sort(),
     );
     for (const row of rows) {
       expect(row.name).toBe(row.href!);
       expect(row.size).toMatch(/^[\d.]+ k?B$/);
       expect(Date.parse(row.updated!)).not.toBeNaN();
-      expect((await get("/_svdr/" + row.href)).status).toBe(200);
+      expect((await get(prefix + row.href)).status).toBe(200);
     }
 
     // Everything a page links to is listed, as are the server only files.
     const html = await (await get("/")).text();
     for (const url of bundledUrls(html)) {
-      expect(rows.map((row) => "/_svdr/" + row.href)).toContain(url);
+      expect(rows.map((row) => prefix + row.href)).toContain(url);
     }
     const serverFiles = rows.filter((row) => row.href!.startsWith("server/"));
     expect(
@@ -537,7 +547,7 @@ describe("bundled files", () => {
         /^server\/index\.server-entry-.+\.js$/.test(row.href!),
       ),
     ).toBe(true);
-    const serverEntry = await get("/_svdr/" + serverFiles[0]!.href);
+    const serverEntry = await get(prefix + serverFiles[0]!.href);
     expect(serverEntry.headers.get("content-type")).toStartWith(
       "text/javascript",
     );
@@ -735,12 +745,16 @@ describe("watching", () => {
     const [sheet] = bundledUrls(html).filter((u) => u.endsWith(".css"));
     const css = await (await get(sheet!)).text();
     const [, font] =
-      /url\("?(\/_svdr\/assets\/f-[^")]+\.woff2)"?\)/.exec(css) ?? [];
+      /url\("?(\/_svdr\/[A-Za-z0-9_-]{5}\/assets\/f-[^")]+\.woff2)"?\)/.exec(
+        css,
+      ) ?? [];
     expect(font).toBeDefined();
     const res = await get(font!);
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("woff2");
-    expect(await (await get("/_svdr/")).text()).toContain("assets/f-");
+    expect(
+      await (await get(entryPrefix(dir, path.join(dir, "fonts.marko")))).text(),
+    ).toContain("assets/f-");
     await rm(path.join(dir, "fonts.marko"));
     await rm(path.join(dir, "node_modules"), { recursive: true });
     await waitFor(
@@ -788,10 +802,10 @@ test("keeps serving the last working build while bundling fails", async () => {
     expect(await text("/about")).toContain("<h1>About</h1>");
     expect(await text("/")).toBe(index);
     for (const url of assets) expect((await get(url)).status).toBe(200);
-    // ...while a page that has never been bundled can only show the error.
+    // ...while another entry can publish its first successful build.
     const added = await get("/new");
-    expect(added.status).toBe(500);
-    expect(await added.text()).toContain("Error bundling new.marko");
+    expect(added.status).toBe(200);
+    expect(await added.text()).toContain("<p>New</p>");
 
     await writeFile(path.join(dir, "about.marko"), "<h1>Fixed</h1>\n");
     await waitFor(async () =>
@@ -877,9 +891,9 @@ test("shows the error when the first build fails", async () => {
   await writeFile(path.join(dir, "about.marko"), "<h1>Broken ${");
   const server = await start(dir);
   try {
-    const res = await fetch(server.url + "/");
+    const res = await fetch(server.url + "/about");
     expect(res.status).toBe(500);
-    expect(await res.text()).toContain("Error bundling index.marko");
+    expect(await res.text()).toContain("Error bundling about.marko");
     expect((await fetch(server.url + "/assets/hello.txt")).status).toBe(200);
   } finally {
     await server.stop();

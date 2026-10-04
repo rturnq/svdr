@@ -47,7 +47,7 @@ test("flags", () => {
       "-p",
       "8080",
       "-c",
-      "zstd, gz",
+      "br, gz",
       "-x",
       ".htm, html",
       "--http",
@@ -56,7 +56,7 @@ test("flags", () => {
   ).toEqual({
     dir: path.resolve("src"),
     port: 8080,
-    compression: ["zstd", "gzip"],
+    compression: ["br", "gzip"],
     extensions: ["htm", "html"],
     http: true,
     prod: true,

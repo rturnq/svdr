@@ -2,7 +2,6 @@ import { bundleAsync, transform } from "lightningcss";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { isServable } from "./paths.ts";
 
 export interface Stylesheet {
   /** The complete stylesheet, including any retained imports and layer declarations. */
@@ -26,16 +25,13 @@ export interface StylesheetOptions {
   code?: string;
   /** The served directory. */
   root: string;
-  /** A file to resolve packages from when the served directory has none. */
-  fallbackDir: string;
   cssModules: boolean;
   /** URL prefix for emitted stylesheet dependencies. */
   assetPrefix?: string;
   /** Minify retained dependency assets before emitting them. */
   minifyAssets?: boolean;
   /**
-   * Gives a referenced file that cannot be served from where it is, such as
-   * a font inside `node_modules`, a URL it can be served from.
+   * Emits a referenced asset into the entry's isolated asset directory.
    */
   emitAsset?: (file: string) => string | null;
 }
@@ -78,10 +74,7 @@ export async function bundleStylesheet(
     const resolved =
       /^(?:\.\.?\/|\/)/.test(name) || existsSync(relative)
         ? existsSync(relative) && relative
-        : findPackageStylesheet(name, [
-            path.dirname(from),
-            options.fallbackDir,
-          ]);
+        : findPackageStylesheet(name, [path.dirname(from)]);
     if (!resolved) {
       throw new Error(
         `Cannot find the stylesheet "${specifier}" imported from ${from}`,
@@ -686,7 +679,6 @@ export function rewriteCssUrls(
       !path.isAbsolute(relative);
     const url = () =>
       "/" + relative.split(path.sep).map(encodeURIComponent).join("/") + suffix;
-    if (inside && isServable(relative)) return url();
     const emitted = emitAsset?.(referenced);
     if (emitted) return emitted + suffix;
     return inside ? url() : null;

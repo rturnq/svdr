@@ -27,7 +27,7 @@ Options:
   -d, --dir <path>          Directory to serve (default: current directory)
   -p, --port <number>       Port to listen on (default: 3000)
   -c, --compression <list>  Comma separated encodings in order of preference:
-                            br, gz, zstd, deflate, or "none" (default: br,gz)
+                            br, gz, or "none" (default: br,gz)
   -x, --extensions <list>   Comma separated extensions to try for paths without
                             one and for directory indexes, in order of
                             preference, or "none" (default: marko,html)

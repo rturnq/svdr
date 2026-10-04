@@ -184,7 +184,6 @@ const bundle = (
     file: path.join(root, file),
     code,
     root,
-    fallbackDir: import.meta.dir,
     cssModules,
   });
 
@@ -287,7 +286,6 @@ test("serves files a stylesheet refers to that cannot be served from where they 
   const { css } = await bundleStylesheet({
     file: path.join(root, "page.css"),
     root,
-    fallbackDir: import.meta.dir,
     cssModules: false,
     emitAsset(file) {
       if (!existsSync(file)) return null;
@@ -295,10 +293,10 @@ test("serves files a stylesheet refers to that cannot be served from where they 
       return `/_svdr/assets/${path.basename(file)}`;
     },
   });
-  expect(emitted).toEqual(["node_modules/fonts/f.woff2"]);
+  expect(emitted).toEqual(["assets/local.png", "node_modules/fonts/f.woff2"]);
   expect(css).toContain("/_svdr/assets/f.woff2");
-  // A file that is served from where it is, is referred to there...
-  expect(css).toMatch(/url\("?\/assets\/local.png"?\)/);
+  // Local assets are isolated alongside package assets...
+  expect(css).toMatch(/url\("?\/_svdr\/assets\/local.png"?\)/);
   // ...and one that does not exist is left to fail where it is.
   expect(css).toMatch(/url\("?\/node_modules\/fonts\/missing.woff"?\)/);
 });
@@ -411,7 +409,6 @@ test("leaves url() imports to the bundler", async () => {
     file: path.join(root, "page.css"),
     code: '@import "pkg";\n',
     root,
-    fallbackDir: import.meta.dir,
     cssModules: false,
     emitAsset(file) {
       emitted.push(path.relative(root, file));
@@ -436,7 +433,6 @@ test("serves assets of packages above the served directory", async () => {
   const { css } = await bundleStylesheet({
     file: path.join(root, "page.css"),
     root,
-    fallbackDir: import.meta.dir,
     cssModules: false,
     emitAsset(file) {
       emitted.push(path.relative(project, file));
@@ -688,7 +684,6 @@ test("retained asset URLs distinguish plain CSS, modules, and minified output", 
   const options = {
     root,
     file: path.join(root, "page.css"),
-    fallbackDir: root,
     cssModules: false,
     code: '@import "https://example.com/remote.css"; @import "./child.css";',
   };

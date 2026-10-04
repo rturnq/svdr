@@ -2,15 +2,13 @@ import { pipeline, Readable } from "node:stream";
 import { promisify } from "node:util";
 import zlib from "node:zlib";
 
-export type Encoding = "br" | "gzip" | "zstd" | "deflate";
+export type Encoding = "br" | "gzip";
 
 const aliases: Record<string, Encoding> = {
   br: "br",
   brotli: "br",
   gz: "gzip",
   gzip: "gzip",
-  zstd: "zstd",
-  deflate: "deflate",
 };
 
 /** Parses a `--compression` value such as `br,gz` into an ordered list of encodings. */
@@ -34,7 +32,7 @@ export function parseCompression(value: string): Encoding[] {
     const encoding = aliases[name];
     if (!encoding) {
       throw new Error(
-        `Unknown compression type "${name}" (expected br, gz, zstd, deflate or none)`,
+        `Unknown compression type "${name}" (expected br, gz or none)`,
       );
     }
     encodings.add(encoding);
@@ -79,8 +77,6 @@ export function isCompressible(contentType: string): boolean {
 
 const brotliCompress = promisify(zlib.brotliCompress);
 const gzip = promisify(zlib.gzip);
-const zstdCompress = promisify(zlib.zstdCompress);
-const deflate = promisify(zlib.deflate);
 
 /**
  * Compresses a complete body off the main thread. `best` trades speed for
@@ -102,12 +98,6 @@ export function compress(
       });
     case "gzip":
       return gzip(data, { level: best ? 9 : 6 });
-    case "zstd":
-      return zstdCompress(data, {
-        params: { [zlib.constants.ZSTD_c_compressionLevel]: best ? 19 : 3 },
-      });
-    case "deflate":
-      return deflate(data, { level: best ? 9 : 6 });
   }
 }
 
@@ -135,9 +125,5 @@ function createCompressor(encoding: Encoding) {
       });
     case "gzip":
       return zlib.createGzip({ flush: zlib.constants.Z_SYNC_FLUSH });
-    case "zstd":
-      return zlib.createZstdCompress({ flush: zlib.constants.ZSTD_e_flush });
-    case "deflate":
-      return zlib.createDeflate({ flush: zlib.constants.Z_SYNC_FLUSH });
   }
 }

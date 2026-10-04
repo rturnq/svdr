@@ -3,7 +3,7 @@ import { compress, compressStream } from "../src/compression.ts";
 
 test("compress works off the main thread and round trips", async () => {
   const data = Buffer.from("hello ".repeat(1000));
-  for (const encoding of ["br", "gzip", "zstd", "deflate"] as const) {
+  for (const encoding of ["br", "gzip"] as const) {
     const compressed = compress(encoding, data);
     expect(compressed).toBeInstanceOf(Promise);
     const stream = new Blob([
