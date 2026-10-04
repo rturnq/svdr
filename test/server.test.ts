@@ -1447,11 +1447,16 @@ test("logs what changed, what is bundled because of it, and the result", async (
       await mkdir(path.join(dir, "docs"));
       await writeFile(path.join(dir, "docs/page.marko"), "<p>doc</p>\n");
     });
-    const removed = await batch(() =>
-      rm(path.join(dir, "docs"), { recursive: true }),
-    );
-    expect(removed).toContain("- docs/page.marko");
-    expect(removed.filter((line) => line === "- docs/page.marko")).toHaveLength(
+    // Windows reports a new file more than once, so the page may still be
+    // bundling when it is removed: its removal is not always the first thing
+    // logged afterwards.
+    lines.length = 0;
+    await rm(path.join(dir, "docs"), { recursive: true });
+    await waitFor(async () => {
+      const at = lines.indexOf("- docs/page.marko");
+      return at !== -1 && lines.includes("", at);
+    });
+    expect(lines.filter((line) => line === "- docs/page.marko")).toHaveLength(
       1,
     );
   } finally {
