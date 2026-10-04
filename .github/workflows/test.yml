@@ -18,7 +18,7 @@ jobs:
       matrix:
         # File systems differ in ways the server has to handle: case
         # sensitivity, symlinked temp directories and how changes are watched.
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
