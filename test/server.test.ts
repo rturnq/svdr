@@ -1,5 +1,14 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { cp, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import {
+  cp,
+  mkdir,
+  mkdtemp,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { entryPrefix } from "../src/bundler.ts";
@@ -177,15 +186,36 @@ describe("static files", () => {
     expect((await get("/assets/hello.txt/")).status).toBe(404);
   });
 
-  test("judges files by their own path, not the requested spelling", async () => {
-    // On a case-insensitive file system these reach excluded files.
-    expect((await get("/TAGS/counter.MARKO")).status).toBe(404);
+  test("judges files by their own path, not the requested one", async () => {
+    // A link to an excluded file is the excluded file, a link to a page is
+    // the page, and a link out of the directory leads nowhere.
+    await symlink(
+      path.join(dir, "tags/counter.marko"),
+      path.join(dir, "alias.txt"),
+    );
+    await symlink(path.join(dir, "index.marko"), path.join(dir, "home.txt"));
+    await symlink(os.tmpdir(), path.join(dir, "outside"));
+    expect((await get("/alias.txt")).status).toBe(404);
+    expect(await (await get("/home.txt")).text()).toContain(
+      "<h1>Hello from svdr</h1>",
+    );
+    expect((await get("/outside/")).status).toBe(404);
+
+    // Where the file system ignores case, another spelling is the same file.
+    const spelling = await get("/TAGS/counter.MARKO");
+    expect(spelling.status).toBe(404);
     expect((await get("/.SECRET")).status).toBe(404);
-    // A page is still a page, and a file still a file.
-    const page = await get("/Index.MARKO");
-    expect(page.status).toBe(200);
-    expect(await page.text()).toContain("<h1>Hello from svdr</h1>");
-    expect((await get("/ASSETS/hello.TXT")).status).toBe(200);
+    if (existsSync(path.join(dir, "INDEX.MARKO"))) {
+      const page = await get("/Index.MARKO");
+      expect(page.status).toBe(200);
+      expect(await page.text()).toContain("<h1>Hello from svdr</h1>");
+      expect((await get("/ASSETS/hello.TXT")).status).toBe(200);
+    } else {
+      expect((await get("/Index.MARKO")).status).toBe(404);
+    }
+    for (const name of ["alias.txt", "home.txt", "outside"]) {
+      await rm(path.join(dir, name));
+    }
   });
 
   test("does not resolve segments that appear once decoded", async () => {
