@@ -1,129 +1,52 @@
 # svdr
 
-Simple directory server with bundling. It serves a directory on localhost over
-HTTP/2 and renders any [Marko](https://markojs.com) template in it as a page,
-bundling the template and everything it imports with
-[Rolldown](https://rolldown.rs).
+A simple local server that serves a directory and bundles Marko files.
+Point it at a directory and open your pages in a browser.
 
-Requires [Bun](https://bun.sh) 1.4.1 or newer.
+It bundles Marko pages and their JavaScript, TypeScript, CSS, and CSS Modules.
+Live reload updates the browser when you edit a file.
+HTTPS and HTTP/2 are enabled by default.
 
 ## Usage
 
+Requires [Bun](https://bun.sh) 1.4.1 or newer.
+
 ```sh
-bun install
-bun src/cli.ts --dir example
+bun install -g svdr
+cd ~/my-site
+svdr
 ```
 
-| Option                | Default               | Description                                                                              |
-| --------------------- | --------------------- | ---------------------------------------------------------------------------------------- |
-| `-d`, `--dir`         | `.`                   | Directory to serve.                                                                      |
-| `-p`, `--port`        | `3000`                | Port to listen on. Fails when the port is taken.                                         |
-| `-c`, `--compression` | `br,gz`               | Encodings in order of preference: `br`, `gz`, or `none`.                                 |
-| `-x`, `--extensions`  | `marko,html`          | Extensions to try, in order, for paths without one and for directory indexes, or `none`. |
-| `-h`, `--hot`         | on, off with `--prod` | Reload pages and swap their styles when files change. `--hot off` turns it off.          |
-| `--http`              |                       | Serve plain HTTP instead of HTTPS.                                                       |
-| `--prod`              |                       | Minified scripts and stylesheets, stronger compression and no source maps.               |
-| `--help`              |                       | Show the options.                                                                        |
-
-By default the server uses HTTPS with a self-signed certificate that is
-generated on first use and kept in `~/.cache/svdr` (or
-`$XDG_CACHE_HOME/svdr`), so it only has to be trusted once. Browsers only
-speak HTTP/2 over TLS, so with `--http` they use HTTP/1.1.
-
-## Files
-
-URL paths map directly to files in the directory:
-
-- `/about` is a file. It serves `about` if that exists and otherwise the
-  first of `about.marko` and `about.html` that does, following
-  `--extensions`. If there is no such file but there is an `about` directory,
-  it redirects to `/about/`.
-- `/about/` is a directory. It serves the first of `about/index.marko` and
-  `about/index.html` that exists, again following `--extensions`.
-
-Dotfiles and `node_modules`, at any level, are never served, and neither
-are the templates in `tags` directories; other files in them, such as the
-images their styles refer to, are. These rules apply to the file's own path, so a different spelling of
-it on a case-insensitive file system or a symlink to it makes no difference.
-Requests that name a host other than this machine are refused.
+This serves the current directory at `https://localhost:3000`.
+The server uses a self-signed certificate.
+Use `svdr --dir ./my-site` to serve a different directory.
 
 ## Pages
 
-Every `.marko` file outside of a `tags` directory is a page: requesting
-`/about` or `/about.marko` renders `about.marko` on the server and streams
-the HTML. Templates in `tags` directories are the custom tags pages are built
-from. Each page is compiled independently into its own server and client
-bundles. Pages share no generated modules, stylesheets, or imported assets,
-even when they import the same source files. A page's files are served from
-`/_svdr/<hash>/`. The five-character hash comes from the relative `.marko` file path,
-so it stays the same when the file is edited or the playground is moved. Scripts
-and stylesheets are linked from that page automatically, in dependency order.
+Each `.marko` file is a separate page. Put reusable components in `tags`
+directories to keep them from becoming pages.
 
-Local stylesheet `@import`s are inlined (package stylesheets can be imported
-by name). When an import chain includes a remote stylesheet, local dependencies
-are emitted into the page's asset directory and the import chain is preserved,
-including its order, conditions, and layers. Relative `url()` assets and assets
-imported from JavaScript are also served from there, under a name with a hash
-of their content. They are not copied: they are read from where they are, so
-they support byte ranges like any other file. Root-relative and remote URLs
-keep their original meaning. CSS Modules (`<style/styles>` blocks and
-`.module.css` files) are supported; other style languages are not.
+- `index.marko` is served at `/`.
+- `about.marko` is served at `/about`.
+- `docs/index.marko` is served at `/docs/`.
 
-`/_svdr/` lists the Marko entry paths, linking to each entry's hashed directory.
-Each entry directory has its own index listing all of its bundled files, their
-sizes, and when they last changed, with a link back to the entry list. Server
-bundles remain available for inspection under `/_svdr/<hash>/server/`. Empty
-client entries are omitted for pages without client-side behavior.
+Other files are served as static files. Dotfiles and `node_modules` are hidden.
+Marko 6 is included. Install any other packages your pages need.
 
-Packages resolve from the importing file's `node_modules` ancestors. Only
-`marko` falls back to the runtime shipped with svdr, so a bare directory of
-templates works without installing anything. Other application dependencies
-must be installed by the project. Marko 6 is required.
+If a build fails, the last working page stays available.
+Visit `/_svdr/` to browse each page's generated files.
 
-The directory is watched recursively, along with imported dependencies outside
-it. An edit rebuilds each page whose import graph contains the changed file;
-a shared dependency rebuilds all of its consuming pages. Changes to tag
-discovery or package mappings can require rebuilding other pages too. Independent
-builds run with bounded concurrency and publish as each page finishes. Existing
-pages remain available while builds run.
+## Options
 
-The terminal shows each file that was changed, added or removed, the entries
-that are bundled because of it with the reason for each, and how each entry
-went. A request for a page that is being bundled for the first time waits for
-it.
+| Option                       | Default      | Description                                                                   |
+| ---------------------------- | ------------ | ----------------------------------------------------------------------------- |
+| `-d`, `--dir <path>`         | `.`          | Directory to serve.                                                           |
+| `-p`, `--port <number>`      | `3000`       | Port to listen on.                                                            |
+| `-c`, `--compression <list>` | `br,gz`      | Brotli (`br`) and gzip (`gz`), in preference order. Use `none` to disable.    |
+| `-x`, `--extensions <list>`  | `marko,html` | Extensions to try for page URLs and directory indexes. Use `none` to disable. |
+| `-h`, `--hot [on\|off]`      | `on`         | Live reload. Defaults to `off` with `--prod`.                                 |
+| `--http`                     | `off`        | Use plain HTTP instead of HTTPS.                                              |
+| `--prod`                     | `off`        | Minify bundles, use stronger compression, and omit source maps.               |
+| `--help`                     |              | Show help.                                                                    |
 
-When an entry fails, its error is logged and its own last working build remains
-available. Other entries can still publish successful builds. A page that has
-never built successfully is served empty, for the notice below to show the
-error and to load the page once it builds; without live reload it responds
-with the error instead. `--prod` keeps the same
-independent build model with minification, stronger compression, and no source
-maps.
-
-## Live reload
-
-With `--hot`, which is on by default except with `--prod`, every page
-connects to the server with a WebSocket at `/_svdr/ws` and is kept up to
-date as files change:
-
-- When only styles changed, whether in a `<style>` block or in a stylesheet
-  the page links to, the stylesheets are swapped in place and the page keeps
-  its state.
-- When anything else a page may show changed, the page reloads.
-- When bundling fails, the page stays as it is and shows the error in a
-  dismissable notice at the top, which goes away once the page bundles
-  again. The error is logged to the browser console as well.
-
-Plain `.html` files take part too: the script that connects them is
-appended to them as they are served.
-
-## Development
-
-```sh
-bun install
-bun run check   # formatting, types and tests
-bun run format
-```
-
-`test/fixture/` is a copy of `example/` that the tests build and serve, kept
-separate so that trying things out in the example cannot break them.
+Separate compression types and extensions with commas.
