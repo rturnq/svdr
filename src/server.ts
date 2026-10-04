@@ -23,6 +23,7 @@ import { serveFile } from "./static.ts";
 import { watchDir } from "./watcher.ts";
 import {
   messagesFor,
+  wsErrorName,
   wsPath,
   wsScript,
   wsScriptPath,
@@ -209,40 +210,56 @@ export async function serveDir(
     });
     if (options.compression.length) headers.set("vary", "accept-encoding");
 
-    // A page that has never bundled has nothing to show. With live reload
-    // it is served empty, for its script to show the error and to load the
-    // page once it bundles.
     const prefix = entryPrefix(root, file);
-    if (!page.template && hot && bundler.failure(prefix)) {
-      return send(
-        req,
-        Buffer.from(`<!doctype html>
+    const script = `<script type="module" src="${wsScriptPath}?entry=${prefix.slice(assetsPrefix.length, -1)}"></script>`;
+    /** Tells the page's script about an error that only this request ran into. */
+    const errorTag = (error: unknown) =>
+      `<meta name="${wsErrorName}" content="${Bun.escapeHTML(`Rendering failed\n${errorMessage(error)}`)}">`;
+    /** A page with nothing but the script, which shows what went wrong. */
+    const emptyPage = (error?: unknown) =>
+      Buffer.from(`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>${Bun.escapeHTML(relative(file))}</title>
+<title>${Bun.escapeHTML(relative(file))}</title>${error === undefined ? "" : `\n${errorTag(error)}`}
 </head>
 <body>
-<script type="module" src="${wsScriptPath}?entry=${prefix.slice(assetsPrefix.length, -1)}"></script>
+${script}
 </body>
 </html>
-`),
-        headers,
-        `${prefix}\0empty`,
-      );
+`);
+
+    // A page that has never bundled has nothing to show. With live reload
+    // it is served empty, for its script to show the error and to load the
+    // page once it bundles.
+    if (!page.template && hot && bundler.failure(prefix)) {
+      return send(req, emptyPage(), headers, `${prefix}\0empty`);
     }
 
+    const logError = (error: unknown) =>
+      log.error(`✗ ${relative(file)}\n${errorMessage(error, true)}`);
     let body: ReadableStream<Uint8Array>;
     try {
       if (!page.template) throw page.error;
       body = await primed(
         page.template.render({ $global: { request: req } }).toReadable(),
+        // Part of the page has been sent. With live reload the rest is
+        // replaced by the error, for the script to show.
+        (error) => {
+          logError(error);
+          if (hot) return Buffer.from(`\n${errorTag(error)}\n${script}\n`);
+        },
       );
     } catch (error) {
-      if (page.template) {
-        log.error(`✗ ${relative(file)}\n${errorMessage(error, true)}`);
-      }
-      return serverError(page, error);
+      if (!page.template) return serverError(page, error);
+      logError(error);
+      if (!hot) return serverError(page, error);
+      // Nothing was rendered. The page is served empty, and still hears
+      // about the change that fixes it.
+      return new Response(req.method === "HEAD" ? null : emptyPage(error), {
+        status: 500,
+        headers,
+      });
     }
 
     const encoding = negotiate(
@@ -530,9 +547,12 @@ function isLoopbackHost(hostname: string) {
 /**
  * Waits for a stream to produce its first chunk, so that an error thrown
  * before anything was rendered can still be turned into an error response.
+ * An error after that is passed to `onError`: the stream ends with what it
+ * returns, or fails with the error when that is nothing.
  */
 async function primed(
   stream: ReadableStream<Uint8Array>,
+  onError: (error: unknown) => Uint8Array | undefined,
 ): Promise<ReadableStream<Uint8Array>> {
   const reader = stream.getReader();
   const first = await reader.read();
@@ -552,9 +572,16 @@ async function primed(
         controller.enqueue(first.value);
         return;
       }
-      const { done, value } = await reader.read();
-      if (done) controller.close();
-      else controller.enqueue(value);
+      try {
+        const { done, value } = await reader.read();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      } catch (error) {
+        const ending = onError(error);
+        if (!ending) return controller.error(error);
+        controller.enqueue(ending);
+        controller.close();
+      }
     },
     cancel(reason) {
       return reader.cancel(reason);

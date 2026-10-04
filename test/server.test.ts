@@ -1109,6 +1109,79 @@ test("serves a page that never bundled empty, for its script to show the error",
   }
 });
 
+test("serves a page that fails to render empty, with the error for its script to show", async () => {
+  const dir = await createSite();
+  await writeFile(
+    path.join(dir, "about.marko"),
+    'static function fail() {\n  throw new Error("boom <now>");\n}\n<p>${fail()}</p>\n',
+  );
+  const lines: string[] = [];
+  const log = (message: string) => lines.push(message);
+  const logger = { info: log, error: log };
+  const script = entryScriptTag(dir, "about.marko");
+
+  const server = await start(dir, { hot: true }, logger);
+  try {
+    const res = await fetch(server.url + "/about");
+    expect(res.status).toBe(500);
+    expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    const html = await res.text();
+    expect(html).toContain(
+      '<meta name="svdr-error" content="Rendering failed\nboom &lt;now&gt;">',
+    );
+    expect(html).toContain(script);
+    expect(lines.some((line) => line.startsWith("✗ about.marko\n"))).toBe(true);
+
+    // The page is still told when its entry changes.
+    const page = await connect(server, dir, "about.marko");
+    try {
+      await writeFile(path.join(dir, "about.marko"), "<h1>Fixed</h1>\n");
+      await waitFor(async () => page.messages.length >= 1);
+      expect(page.messages).toEqual([{ type: "reload" }]);
+    } finally {
+      page.socket.close();
+    }
+  } finally {
+    await server.stop();
+  }
+
+  await writeFile(
+    path.join(dir, "about.marko"),
+    'static function fail() {\n  throw new Error("boom");\n}\n<p>${fail()}</p>\n',
+  );
+  const off = await start(dir, { hot: false }, logger);
+  try {
+    const res = await fetch(off.url + "/about");
+    expect(res.status).toBe(500);
+    expect(await res.text()).toContain("Error rendering about.marko\n\nboom");
+  } finally {
+    await off.stop();
+  }
+});
+
+test("ends a page that fails after it started rendering with the error", async () => {
+  const dir = await createSite();
+  await writeFile(
+    path.join(dir, "about.marko"),
+    'static const late = () =>\n  new Promise((_, reject) => setTimeout(() => reject(new Error("late")), 50));\n<h1>Started</h1>\n<await|value|=late()>${value}</await>\n',
+  );
+  const lines: string[] = [];
+  const log = (message: string) => lines.push(message);
+  const server = await start(dir, { hot: true }, { info: log, error: log });
+  try {
+    const res = await fetch(server.url + "/about");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("<h1>Started</h1>");
+    expect(html).toEndWith(
+      `\n<meta name="svdr-error" content="Rendering failed\nlate">\n${entryScriptTag(dir, "about.marko")}\n`,
+    );
+    expect(lines.some((line) => line.startsWith("✗ about.marko\n"))).toBe(true);
+  } finally {
+    await server.stop();
+  }
+});
+
 test("responds with the error for a page that never bundled when there is no live reload", async () => {
   const dir = await createSite();
   await writeFile(path.join(dir, "about.marko"), "<h1>Broken ${");

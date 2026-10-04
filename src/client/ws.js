@@ -156,4 +156,11 @@ pre:empty {
   document.documentElement.append(toast);
 }
 
+// A page that failed while it was being rendered says so itself.
+const failure = document.querySelector('meta[name="svdr-error"]');
+if (failure) {
+  console.error("[svdr] " + failure.content);
+  showError(failure.content);
+}
+
 connect();

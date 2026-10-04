@@ -10,6 +10,11 @@ export const wsPath = `${assetsPrefix}ws`;
 export const wsScriptPath = `${wsPath}.js`;
 /** How a page loads that script. */
 export const wsScriptTag = `<script type="module" src="${wsScriptPath}"></script>`;
+/**
+ * The `<meta>` a page carries when rendering it failed, with the error as
+ * its content, for the script to show.
+ */
+export const wsErrorName = "svdr-error";
 export { wsScript };
 
 export type WsMessage =
