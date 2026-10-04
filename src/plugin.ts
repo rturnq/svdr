@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { Plugin } from "rolldown";
+import { hashFile, type FileRef } from "./assets.ts";
 import { assetUrl } from "./bundler.ts";
 import { bundleStylesheet, type Stylesheet } from "./css.ts";
 import {
@@ -92,7 +93,11 @@ export interface MarkoPluginOptions {
   /** Receives every stylesheet the client build encounters, by module id. */
   css: Map<string, Pick<Stylesheet, "css" | "fileName">>;
   /** Adds a file to the bundle, to be served under the assets prefix. */
-  emitFile: (fileName: string, body: Uint8Array, type: string) => void;
+  emitFile: (
+    fileName: string,
+    content: Uint8Array | FileRef,
+    type: string,
+  ) => void;
   /**
    * Receives what every module of the client build imports, by module id.
    * Style modules leave nothing behind in the bundle, so this is what tells
@@ -138,15 +143,13 @@ export function markoPlugins(opts: MarkoPluginOptions): {
   /** Serves a file a stylesheet refers to as part of the bundle. */
   const emitAsset = (file: string) => {
     assetFiles.add(file);
-    let body;
-    try {
-      body = readFileSync(file);
-    } catch {
-      return null;
-    }
+    // The file stays where it is: only its name carries its content.
+    const ref = hashFile(file);
+    if (!ref) return null;
+    const { hash, ...content } = ref;
     const ext = path.extname(file);
-    const fileName = `assets/${path.basename(file, ext)}-${Bun.hash(body).toString(36)}${ext}`;
-    opts.emitFile(fileName, body, Bun.file(file).type);
+    const fileName = `assets/${path.basename(file, ext)}-${hash}${ext}`;
+    opts.emitFile(fileName, content, Bun.file(file).type);
     return assetUrl(opts.assetPrefix + fileName);
   };
 

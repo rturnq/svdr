@@ -1,4 +1,9 @@
-import { isCompressible } from "./compression.ts";
+import {
+  compressStream,
+  isCompressible,
+  negotiate,
+  type Encoding,
+} from "./compression.ts";
 import type { Send } from "./respond.ts";
 import { wsScriptTag } from "./ws.ts";
 
@@ -11,7 +16,10 @@ export interface StaticOptions {
   send: Send;
   /** Whether html files take part in live reload. */
   hot: boolean;
-  compression: boolean;
+  /** Encodings to offer, in order of preference. */
+  compression: readonly Encoding[];
+  /** How long the response may be reused; revalidated every time by default. */
+  cacheControl?: string;
 }
 
 /** Serves a file as it is, apart from the live reload script html files get. */
@@ -29,7 +37,7 @@ export async function serveFile(
   const etag = `W/"${size.toString(36)}-${Math.round(mtime.getTime()).toString(36)}${inject ? "-hot" : ""}"`;
   const headers = new Headers({
     "content-type": blob.type,
-    "cache-control": "no-cache",
+    "cache-control": options.cacheControl ?? "no-cache",
     "last-modified": mtime.toUTCString(),
     etag,
   });
@@ -71,12 +79,23 @@ export async function serveFile(
     }
   }
 
-  if (
-    options.compression &&
-    size <= maxCompressSize &&
-    isCompressible(blob.type)
-  ) {
-    return options.send(req, await blob.bytes(), headers, `${file}\0${etag}`);
+  if (options.compression.length && isCompressible(blob.type)) {
+    if (size <= maxCompressSize) {
+      return options.send(req, await blob.bytes(), headers, `${file}\0${etag}`);
+    }
+    // Too large to hold in memory: compressed as it is read from disk.
+    headers.append("vary", "accept-encoding");
+    const encoding = negotiate(
+      req.headers.get("accept-encoding"),
+      options.compression,
+    );
+    if (encoding) {
+      headers.set("content-encoding", encoding);
+      return new Response(
+        req.method === "HEAD" ? null : compressStream(encoding, blob.stream()),
+        { headers },
+      );
+    }
   }
 
   headers.set("content-length", String(size));

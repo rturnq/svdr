@@ -1,6 +1,12 @@
 import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
-import { assetsPrefix, assetUrl, Bundler, type Page } from "./bundler.ts";
+import {
+  assetsPrefix,
+  assetUrl,
+  Bundler,
+  entryPrefix,
+  type Page,
+} from "./bundler.ts";
 import { loadCertificate } from "./cert.ts";
 import { compressStream, negotiate } from "./compression.ts";
 import { renderEntries, renderListing } from "./listing.ts";
@@ -20,6 +26,7 @@ import {
   wsPath,
   wsScript,
   wsScriptPath,
+  type Notice,
   type WsMessage,
 } from "./ws.ts";
 
@@ -30,6 +37,12 @@ export interface ServeDir {
   url: string;
   bundler: Bundler;
   stop(): Promise<void>;
+}
+
+/** What the server knows about a connected page. */
+interface SocketData {
+  /** The directory of the entry the page was rendered from, if it was. */
+  entry?: string;
 }
 
 export interface Logger {
@@ -47,27 +60,49 @@ export async function serveDir(
   const relative = (file: string) => path.relative(root, file);
   const { hot } = options;
 
+  /** The removed files logged for the changes being handled. */
+  let loggedRemoved = new Set<string>();
+
   const bundler = new Bundler({
     root,
     prod: options.prod,
     script: hot ? wsScriptPath : undefined,
     marko: await loadMarko(root),
-    onBuild({ pages, error, ms }) {
-      if (error) {
-        const kept = pages.some((page) => page.template)
-          ? ", still serving the last working build"
-          : "";
-        log.error(`✗ Bundling failed${kept}\n${errorMessage(error)}`);
-        return;
-      }
-      const count = `${pages.length} page${pages.length === 1 ? "" : "s"}`;
-      log.info(`✓ Bundled ${count} (${Math.round(ms)}ms)`);
-      for (const page of pages) {
-        if (page.error) {
-          log.error(
-            `✗ ${relative(page.file)}\n${errorMessage(page.error, true)}`,
-          );
+    onEvent(event) {
+      switch (event.type) {
+        case "plan": {
+          const count = event.entries.length;
+          log.info(`↻ bundling ${count} ${count === 1 ? "entry" : "entries"}`);
+          break;
         }
+        case "entry": {
+          const time = `(${Math.round(event.ms)}ms)`;
+          if (!event.error) {
+            log.info(`  ✓ ${relative(event.file)} ${time}`);
+          } else {
+            const kept = event.kept
+              ? ", still serving its last working build"
+              : "";
+            // The entry is named on this line already.
+            const message = errorMessage(event.error.cause ?? event.error);
+            log.error(
+              `  ✗ ${relative(event.file)} ${time}${kept}\n${message.replace(/^(?=.)/gm, "  ")}`,
+            );
+          }
+          break;
+        }
+        case "removed":
+          // Usually the file's own removal was logged; a page that went away
+          // with its directory is only known from here.
+          if (!loggedRemoved.has(event.file)) {
+            log.info(`- ${relative(event.file)}`);
+          }
+          break;
+        case "collision":
+          log.error(
+            `! hash collision: ${relative(event.file)} and ${relative(event.other)} both map to ${event.prefix}; ${relative(event.file)} is not served`,
+          );
+          break;
       }
     },
   });
@@ -76,23 +111,43 @@ export async function serveDir(
   const staticOptions = {
     send,
     hot,
-    compression: options.compression.length > 0,
+    compression: options.compression,
   };
   const tls = options.http ? undefined : await loadCertificate();
 
-  const serveAsset = (req: Request, pathname: string) => {
+  // The name of an asset changes whenever its content does.
+  const immutable = "public, max-age=31536000, immutable";
+
+  const serveAsset = async (req: Request, pathname: string) => {
     const asset = bundler.assets.get(pathname);
     if (!asset) return notFound();
-    return send(
-      req,
-      asset.body,
-      new Headers({
-        "content-type": asset.type,
-        // The name of an asset changes whenever its content does.
-        "cache-control": "public, max-age=31536000, immutable",
-      }),
-      pathname,
-    );
+    if ("body" in asset) {
+      return send(
+        req,
+        asset.body,
+        new Headers({
+          "content-type": asset.type,
+          "cache-control": immutable,
+        }),
+        pathname,
+      );
+    }
+    // A file a page refers to is served from where it is, like any file.
+    // Its URL stands for the content it had when it was bundled, so once
+    // the file has changed there is nothing to serve under that URL.
+    const stats = await stat(asset.file).catch(() => null);
+    if (
+      !stats?.isFile() ||
+      stats.size !== asset.size ||
+      stats.mtimeMs !== asset.mtimeMs
+    ) {
+      return notFound();
+    }
+    return serveFile(req, asset.file, stats.size, stats.mtime, {
+      ...staticOptions,
+      hot: false,
+      cacheControl: immutable,
+    });
   };
 
   const pageUrl = async (file: string) => {
@@ -141,7 +196,9 @@ export async function serveDir(
   };
 
   const servePage = async (req: Request, file: string) => {
-    const page = bundler.pages.get(file);
+    // A page that is being bundled for the first time is waited for; one
+    // that has been bundled before is served as it is while it rebuilds.
+    const page = await bundler.page(file);
     if (!page) return notFound();
 
     const headers = new Headers({
@@ -149,6 +206,29 @@ export async function serveDir(
       "cache-control": "no-cache",
     });
     if (options.compression.length) headers.set("vary", "accept-encoding");
+
+    // A page that has never bundled has nothing to show. With live reload
+    // it is served empty, for its script to show the error and to load the
+    // page once it bundles.
+    const prefix = entryPrefix(root, file);
+    if (!page.template && hot && bundler.failure(prefix)) {
+      return send(
+        req,
+        Buffer.from(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>${Bun.escapeHTML(relative(file))}</title>
+</head>
+<body>
+<script type="module" src="${wsScriptPath}?entry=${prefix.slice(assetsPrefix.length, -1)}"></script>
+</body>
+</html>
+`),
+        headers,
+        `${prefix}\0empty`,
+      );
+    }
 
     let body: ReadableStream<Uint8Array>;
     try {
@@ -175,6 +255,10 @@ export async function serveDir(
     // request the server sends the headers alone.
     return new Response(body, { headers });
   };
+
+  /** A bundling error as pages show it; the entry is the page's own. */
+  const describeError = (error: Error) =>
+    `Bundling failed\n${errorMessage(error.cause ?? error)}`;
 
   const serverError = (page: Page, error: unknown) =>
     new Response(
@@ -207,7 +291,7 @@ export async function serveDir(
       : serveFile(req, file, stats.size, stats.mtime, staticOptions);
   };
 
-  const fetch = async (req: Request, server: Bun.Server<undefined>) => {
+  const fetch = async (req: Request, server: Bun.Server<SocketData>) => {
     if (req.method !== "GET" && req.method !== "HEAD") {
       return new Response("Method Not Allowed", {
         status: 405,
@@ -242,7 +326,11 @@ export async function serveDir(
     }
 
     if (hot && pathname === wsPath) {
-      if (server.upgrade(req)) return;
+      // A rendered page names its entry by the hash of its directory.
+      const hash = url.searchParams.get("entry");
+      const entry =
+        hash && /^[\w-]+$/.test(hash) ? `${assetsPrefix}${hash}/` : undefined;
+      if (server.upgrade(req, { data: { entry } })) return;
       return new Response("Upgrade Required", {
         status: 426,
         headers: { upgrade: "websocket" },
@@ -312,7 +400,7 @@ export async function serveDir(
   };
 
   // "localhost" is either of the loopback addresses, depending on who asks.
-  const servers: Bun.Server<undefined>[] = [];
+  const servers: Bun.Server<SocketData>[] = [];
   const listen = (hostname: string, port: number) => {
     servers.push(
       Bun.serve({
@@ -323,7 +411,23 @@ export async function serveDir(
         fetch,
         websocket: {
           open(socket) {
+            // Every page hears about files that are served as they are, and
+            // a rendered page also about its own entry.
             socket.subscribe(wsTopic);
+            const { entry } = socket.data;
+            if (!entry) return;
+            socket.subscribe(`${wsTopic}:${entry}`);
+            // A page that loads while its entry is failing was not there
+            // when that was announced.
+            const error = bundler.failure(entry);
+            if (error) {
+              socket.send(
+                JSON.stringify({
+                  type: "error",
+                  message: describeError(error),
+                } satisfies WsMessage),
+              );
+            }
           },
           message() {},
         },
@@ -352,24 +456,47 @@ export async function serveDir(
     throw error;
   }
 
-  const publish = (message: WsMessage) => {
+  const publish = ({ entry, message }: Notice) => {
+    const topic = entry ? `${wsTopic}:${entry}` : wsTopic;
     for (const server of servers) {
-      server.publish(wsTopic, JSON.stringify(message));
+      server.publish(topic, JSON.stringify(message));
     }
   };
 
-  const watcher = watchDir(root, async (paths) => {
+  /** Files seen to exist, to tell a file being replaced from one being added. */
+  const known = new Set<string>();
+  const watcher = watchDir(root, async (changes) => {
     try {
+      const paths = new Set(changes.keys());
+      const dependencies = bundler.dependencies;
+      loggedRemoved = new Set();
+      for (const [file, event] of changes) {
+        const stats = await stat(file).catch(() => null);
+        const wasKnown =
+          known.has(file) || dependencies.has(file) || bundler.pages.has(file);
+        if (!stats) {
+          known.delete(file);
+          loggedRemoved.add(file);
+          log.info(`- ${relative(file)}`);
+        } else if (!stats.isDirectory()) {
+          known.add(file);
+          // A file that appeared is new when it has not been modified since
+          // it was created. One saved by replacing it looks the same, unless
+          // it was seen before.
+          const added =
+            event === "rename" &&
+            !wasKnown &&
+            stats.mtimeMs - stats.birthtimeMs < 100;
+          log.info(added ? `+ ${relative(file)}` : `~ ${relative(file)}`);
+        }
+      }
       const result = await bundler.update(paths);
+      // What follows belongs to the next change.
+      log.info("");
       watcher.updateDependencies(bundler.dependencies);
       if (!hot) return;
-      const messages = await messagesFor(
-        root,
-        paths,
-        result,
-        (error) => `Bundling failed\n${errorMessage(error)}`,
-      );
-      for (const message of messages) publish(message);
+      const messages = await messagesFor(root, paths, result, describeError);
+      for (const notice of messages) publish(notice);
     } catch (error) {
       log.error(errorMessage(error, true));
     }

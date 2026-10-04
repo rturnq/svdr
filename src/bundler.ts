@@ -3,6 +3,7 @@ import { mkdtemp, readdir, realpath, rm, stat, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { rolldown, type OutputChunk } from "rolldown";
+import type { FileRef } from "./assets.ts";
 import { minifyCss, type Stylesheet } from "./css.ts";
 import type { MarkoToolchain } from "./marko.ts";
 import { isIgnored, isTagsPath } from "./paths.ts";
@@ -32,12 +33,16 @@ const taglibFileReg = /(?:^|[\\/])marko(?:-tag)?\.json$/;
  */
 const conventionFileReg = /(?:^|[\\/])(?:[^\\/]+\.)?style\.\w+$/;
 
-export interface Asset {
-  body: Uint8Array;
+/**
+ * A file of a bundle: generated, and held in memory, or a file a page
+ * refers to, which stays on disk and is served from there.
+ */
+export type Asset = {
   type: string;
+  size: number;
   /** When a build last changed the file. */
   updated: Date;
-}
+} & ({ body: Uint8Array } | FileRef);
 
 export interface EntryFiles {
   /** Page path relative to the served directory. */
@@ -56,7 +61,11 @@ export function entryPrefix(root: string, file: string): string {
   return `${assetsPrefix}${hash}/`;
 }
 
-type Emit = (fileName: string, body: Uint8Array, type: string) => void;
+type Emit = (
+  fileName: string,
+  content: Uint8Array | FileRef,
+  type: string,
+) => void;
 
 export interface Template {
   render(input?: Record<string, unknown>): PromiseLike<string> & {
@@ -80,9 +89,20 @@ export interface BuildResult {
    * successful entries publish independently.
    */
   error?: Error;
-  /** What a page that was rendered by the previous build has to do to be current. */
-  changes: Changes;
+  /**
+   * What happened to each entry of the batch, by its directory. Entries are
+   * independent, so a page only has to act on what happened to its own.
+   */
+  entries: Map<string, EntryResult>;
   ms: number;
+}
+
+export interface EntryResult {
+  /** What a page rendered by the entry's previous build has to do to be current. */
+  changes: Changes;
+  error?: Error;
+  /** Whether the entry bundled again after its last build had failed. */
+  recovered?: boolean;
 }
 
 export interface Changes {
@@ -102,13 +122,26 @@ export interface UpdateResult {
 type AssetTag = ["style" | "preload" | "script", string];
 type AssetManifest = Record<string, { block: AssetTag[]; defer: AssetTag[] }>;
 
+/** What the bundler is doing, as it happens. Paths are absolute. */
+export type BundlerEvent =
+  /** The entries a batch is about to bundle, and why each one. */
+  | { type: "plan"; entries: { file: string; reason: string }[] }
+  /** An entry finished. With an error, `kept` tells whether its last working build is still served. */
+  | { type: "entry"; file: string; ms: number; error?: Error; kept: boolean }
+  /** A page that no longer exists was dropped. */
+  | { type: "removed"; file: string }
+  /** Two pages map to the same directory; the second one cannot be served. */
+  | { type: "collision"; prefix: string; file: string; other: string }
+  /** A batch finished. */
+  | { type: "done"; bundled: number; failed: number; ms: number };
+
 export interface BundlerOptions {
   root: string;
   marko: MarkoToolchain;
   prod: boolean;
   /** URL of a script to load on every page. */
   script?: string;
-  onBuild?(result: BuildResult): void;
+  onEvent?(event: BundlerEvent): void;
 }
 
 /** Owns independent builds for each page in the served directory. */
@@ -118,6 +151,12 @@ export class Bundler {
   #entries = new Map<string, Entry>();
   #assets = new Map<string, Asset>();
   #queue: Promise<unknown> = Promise.resolve();
+  /** Resolves once every queued batch has named the entries it will bundle. */
+  #registered: Promise<void> = Promise.resolve();
+  /** The first build of each entry that has not been bundled yet. */
+  #first = new Map<string, Promise<void>>();
+  /** Pages that cannot be served because another page has their directory. */
+  #collided = new Set<string>();
 
   constructor(opts: BundlerOptions) {
     this.#opts = opts;
@@ -139,22 +178,49 @@ export class Bundler {
     }));
   }
 
+  /**
+   * Why the entry with the given directory is failing to bundle, if it is.
+   * What the entry serves meanwhile is its last working build, or nothing.
+   */
+  failure(prefix: string): Error | undefined {
+    for (const entry of this.#entries.values()) {
+      if (entry.prefix === prefix) return entry.error;
+    }
+  }
+
   get dependencies(): ReadonlySet<string> {
     return new Set(
       [...this.#entries.values()].flatMap((entry) => [...entry.deps]),
     );
   }
 
+  /**
+   * The page for a file, waiting for its first build when that is queued or
+   * running. A page that has been bundled before is returned as it is, even
+   * while it is being bundled again.
+   */
+  async page(file: string): Promise<Page | undefined> {
+    const page = this.pages.get(file);
+    if (page) return page;
+    await this.#registered;
+    await this.#first.get(file);
+    return this.pages.get(file);
+  }
+
   scan(): Promise<BuildResult> {
-    return this.#enqueue(async () => {
+    return this.#enqueue(async (registered) => {
       const files = await findPages(this.#opts.root);
-      return this.#build(files, new Set(files));
+      return this.#build(
+        files,
+        new Map(files.map((file) => [file, "new"])),
+        registered,
+      );
     });
   }
 
   update(changed: Iterable<string>): Promise<UpdateResult> {
     const paths = [...changed];
-    return this.#enqueue(async () => {
+    return this.#enqueue(async (registered) => {
       const stats = new Map(
         await Promise.all(
           paths.map(
@@ -177,7 +243,10 @@ export class Bundler {
       const previousDeps = new Set(
         [...this.#entries.values()].flatMap((entry) => [...entry.deps]),
       );
-      const affected = new Set<string>();
+      const relative = (file: string) =>
+        path.relative(this.#opts.root, file).split(path.sep).join("/");
+      /** The entries to bundle, each with the reason why. */
+      const affected = new Map<string, string>();
       const structural: string[] = [];
       for (const file of paths) {
         // Tag discovery and package mappings may introduce new dependencies.
@@ -197,24 +266,32 @@ export class Bundler {
       }
       for (const file of files) {
         const entry = this.#entries.get(file);
-        if (
-          !entry ||
-          entry.failed ||
-          structural.length ||
-          paths.some((changed) =>
+        if (!entry) {
+          // A page that lost its directory to another one is only tried
+          // again when the pages themselves changed.
+          if (!this.#collided.has(file) || discoveryChanged) {
+            affected.set(file, "new");
+          }
+        } else if (entry.failed) {
+          affected.set(file, "its last build failed");
+        } else if (structural.length) {
+          affected.set(file, `${relative(structural[0]!)} changed`);
+        } else {
+          const dep = paths.find((changed) =>
             [...entry.deps].some(
               (dep) => dep === changed || dep.startsWith(changed + path.sep),
             ),
-          )
-        )
-          affected.add(file);
+          );
+          if (dep === file) affected.set(file, "changed");
+          else if (dep) affected.set(file, `uses ${relative(dep)}`);
+        }
       }
       const removed = [...this.#entries.keys()].some(
         (file) => !files.includes(file),
       );
       const build =
         affected.size || removed
-          ? await this.#build(files, affected)
+          ? await this.#build(files, affected, registered)
           : undefined;
       const deps = new Set([
         ...previousDeps,
@@ -241,24 +318,56 @@ export class Bundler {
     );
   }
 
-  #enqueue<T>(task: () => Promise<T>): Promise<T> {
-    const result = this.#queue.then(task);
+  /**
+   * Runs a task after the ones before it. The task calls `registered` once
+   * it has named the entries it will bundle, for `page()` to wait on them.
+   */
+  #enqueue<T>(task: (registered: () => void) => Promise<T>): Promise<T> {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    const before = this.#registered;
+    this.#registered = before.then(() => promise);
+    const result = this.#queue.then(() => task(resolve)).finally(resolve);
     this.#queue = result.catch(() => {});
     return result;
   }
 
-  async #build(files: string[], affected: Set<string>): Promise<BuildResult> {
+  async #build(
+    found: string[],
+    affected: Map<string, string>,
+    registered: () => void,
+  ): Promise<BuildResult> {
     const start = performance.now();
+    const emit = (event: BundlerEvent) => this.#opts.onEvent?.(event);
+    // A page whose directory is taken by another page cannot be served; the
+    // page that had the directory first, or comes first, keeps it.
     const prefixes = new Map<string, string>();
-    for (const file of files) {
+    for (const file of [
+      ...found.filter((file) => this.#entries.has(file)),
+      ...found.filter((file) => !this.#entries.has(file)),
+    ]) {
       const prefix = entryPrefix(this.#opts.root, file);
       const other = prefixes.get(prefix);
-      if (other)
-        throw new Error(`Entry path hash collision: ${other} and ${file}`);
-      prefixes.set(prefix, file);
+      if (other === undefined) {
+        prefixes.set(prefix, file);
+        this.#collided.delete(file);
+        continue;
+      }
+      if (!this.#collided.has(file)) {
+        emit({ type: "collision", prefix, file, other });
+      }
+      this.#collided.add(file);
+      this.pages.set(file, {
+        file,
+        error: new Error(
+          `${path.relative(this.#opts.root, file)} maps to the same directory (${prefix}) as ${path.relative(this.#opts.root, other)} and cannot be served alongside it`,
+        ),
+      });
     }
-    const previousAssets = new Map(this.#assets);
-    const previousStyles = this.#styleKeys();
+    for (const file of this.#collided) {
+      if (!found.includes(file)) this.#collided.delete(file);
+    }
+    const files = found.filter((file) => !this.#collided.has(file));
+    const results = new Map<string, EntryResult>();
     const errors: Error[] = [];
     for (const [file, entry] of this.#entries) {
       if (files.includes(file)) continue;
@@ -266,10 +375,36 @@ export class Bundler {
       this.pages.delete(file);
       for (const url of entry.assets.keys()) this.#assets.delete(url);
       await entry.close();
+      results.set(entry.prefix, { changes: { reload: true, styles: [] } });
+      emit({ type: "removed", file });
+    }
+    for (const file of this.pages.keys()) {
+      if (!found.includes(file)) this.pages.delete(file);
     }
     // Clear once before starting the independent compilers, never during one.
     this.#opts.marko.compiler.taglib.clearCaches();
     const pending = files.filter((file) => affected.has(file));
+    // Entries exist before any of them is bundled, so that a request for a
+    // page that has not been bundled yet can wait for it.
+    const firsts = new Map<string, () => void>();
+    for (const file of pending) {
+      if (this.#entries.has(file)) continue;
+      this.#entries.set(file, new Entry(this.#opts, file));
+      const { promise, resolve } = Promise.withResolvers<void>();
+      this.#first.set(file, promise);
+      firsts.set(file, resolve);
+    }
+    registered();
+    if (pending.length) {
+      emit({
+        type: "plan",
+        entries: pending.map((file) => ({
+          file,
+          reason: affected.get(file)!,
+        })),
+      });
+    }
+    let failed = 0;
     let next = 0;
     // Bound native build concurrency so a directory with many examples does
     // not start two bundlers for every page at once.
@@ -277,19 +412,41 @@ export class Bundler {
       Array.from({ length: Math.min(4, pending.length) }, async () => {
         while (next < pending.length) {
           const file = pending[next++]!;
-          let entry = this.#entries.get(file);
-          if (!entry) {
-            entry = new Entry(this.#opts, file);
-            this.#entries.set(file, entry);
-          }
-          const oldUrls = [...entry.assets.keys()];
+          const entry = this.#entries.get(file)!;
+          const oldAssets = entry.assets;
+          const oldStyleKeys = entry.styleKeys;
+          const oldUrls = [...oldAssets.keys()];
+          const wasFailed = entry.failed;
+          const started = performance.now();
           const error = await entry.build();
-          if (error) errors.push(error);
+          if (error) {
+            errors.push(error);
+            failed++;
+          }
+          results.set(entry.prefix, {
+            changes: diff(
+              oldAssets,
+              oldStyleKeys,
+              entry.assets,
+              entry.styleKeys,
+            ),
+            error,
+            recovered: wasFailed && !error,
+          });
           // Publish each entry as soon as it is ready. Other builds neither
           // block its requests nor prevent it from keeping its last good output.
           for (const url of oldUrls) this.#assets.delete(url);
           for (const [url, asset] of entry.assets) this.#assets.set(url, asset);
           this.pages.set(file, entry.page);
+          this.#first.delete(file);
+          firsts.get(file)?.();
+          emit({
+            type: "entry",
+            file,
+            ms: performance.now() - started,
+            error,
+            kept: !!error && !!entry.page.template,
+          });
         }
       }),
     );
@@ -298,22 +455,18 @@ export class Bundler {
       error: errors.length
         ? new Error(errors.map((error) => error.message).join("\n\n"))
         : undefined,
-      changes: diff(
-        previousAssets,
-        previousStyles,
-        this.#assets,
-        this.#styleKeys(),
-      ),
+      entries: results,
       ms: performance.now() - start,
     };
-    this.#opts.onBuild?.(result);
+    if (pending.length) {
+      emit({
+        type: "done",
+        bundled: pending.length - failed,
+        failed,
+        ms: result.ms,
+      });
+    }
     return result;
-  }
-
-  #styleKeys() {
-    return new Map(
-      [...this.#entries.values()].flatMap((entry) => [...entry.styleKeys]),
-    );
   }
 }
 
@@ -324,6 +477,8 @@ class Entry {
   styleKeys = new Map<string, string>();
   deps: Set<string>;
   failed = false;
+  /** Why the last build failed, if it did. */
+  error: Error | undefined;
   #opts: BundlerOptions;
   readonly prefix: string;
   #outDir: Promise<string> | undefined;
@@ -347,6 +502,7 @@ class Entry {
       this.deps = bundled.deps;
       this.#serverFiles = bundled.serverFiles;
       this.failed = false;
+      this.error = undefined;
     } catch (cause) {
       error = new Error(
         `${path.relative(this.#opts.root, this.page.file)}: ${(cause as Error).message}`,
@@ -354,6 +510,7 @@ class Entry {
       );
       if (!this.page.template) this.page = { file: this.page.file, error };
       this.failed = true;
+      this.error = error;
     }
     if (this.#outDir) {
       const outDir = await this.#outDir.catch(() => undefined);
@@ -391,12 +548,17 @@ class Entry {
     const assets = new Map<string, Asset>();
     const serverFiles = new Set<string>();
     const now = new Date();
-    const emit: Emit = (fileName, body, type) => {
+    const emit: Emit = (fileName, content, type) => {
       const url = this.prefix + fileName;
       // The name of a file includes a hash of its content, so a file that
       // is already there has not changed.
       const updated = this.assets.get(url)?.updated ?? now;
-      assets.set(url, { body, type, updated });
+      assets.set(
+        url,
+        content instanceof Uint8Array
+          ? { body: content, size: content.length, type, updated }
+          : { ...content, type, updated },
+      );
     };
     const plugins = markoPlugins({
       root,
@@ -696,7 +858,14 @@ function createManifest(
 
   for (const { assetId, chunk, styleIds, isPage } of entries) {
     const scripts = scriptTags(chunk);
-    if (isPage && script) scripts.push(["script", script]);
+    // The script is told which entry the page belongs to, to hear about
+    // that entry only.
+    if (isPage && script) {
+      scripts.push([
+        "script",
+        `${script}?entry=${prefix.slice(assetsPrefix.length, -1)}`,
+      ]);
+    }
     manifest[assetId] = {
       block: [
         ...new Set(

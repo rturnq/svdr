@@ -10,10 +10,16 @@ export interface DirectoryWatcher {
 /** Watches the playground plus dependencies it actually consumes elsewhere. */
 export function watchDir(
   root: string,
-  onChange: (paths: Set<string>) => void,
+  /**
+   * Receives the paths that changed, each with whether the file system
+   * reported it as an edit (`change`) or as a file appearing or
+   * disappearing (`rename`), which is also how a file saved by replacing
+   * it shows up.
+   */
+  onChange: (paths: Map<string, "change" | "rename">) => void,
   delay = 50,
 ): DirectoryWatcher {
-  let pending = new Set<string>();
+  let pending = new Map<string, "change" | "rename">();
   let dependencies = new Set<string>();
   let timer: Timer | undefined;
   let closed = false;
@@ -21,20 +27,22 @@ export function watchDir(
   const used = (file: string) =>
     dependencies.has(file) ||
     [...dependencies].some((dep) => dep.startsWith(file + path.sep));
-  const notify = (file: string) => {
+  const notify = (file: string, event: string) => {
     if (closed) return;
-    pending.add(file);
+    if (event === "rename" || !pending.has(file)) {
+      pending.set(file, event === "rename" ? "rename" : "change");
+    }
     clearTimeout(timer);
     timer = setTimeout(() => {
       const paths = pending;
-      pending = new Set();
+      pending = new Map();
       onChange(paths);
     }, delay);
   };
-  const watcher = watch(root, { recursive: true }, (_event, filename) => {
+  const watcher = watch(root, { recursive: true }, (event, filename) => {
     if (!filename) return;
     const file = path.join(root, filename);
-    if (!isIgnored(filename) || used(file)) notify(file);
+    if (!isIgnored(filename) || used(file)) notify(file, event);
   });
 
   return {
@@ -59,10 +67,10 @@ export function watchDir(
         try {
           external.set(
             dir,
-            watch(dir, (_event, filename) => {
+            watch(dir, (event, filename) => {
               if (!filename) return;
               const file = path.join(dir, filename);
-              if (used(file)) notify(file);
+              if (used(file)) notify(file, event);
             }),
           );
         } catch {

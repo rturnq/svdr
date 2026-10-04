@@ -13,7 +13,12 @@ export function renderEntries(entries: readonly EntryFiles[]): string {
     .map(({ file, prefix, assets }) => {
       const size = [...assets].reduce(
         (sum, [url, asset]) =>
-          sum + (url.startsWith(prefix + "server/") ? 0 : asset.body.length),
+          // What a browser loads to show the page: not the server bundle,
+          // and not source maps.
+          sum +
+          (url.startsWith(prefix + "server/") || url.endsWith(".map")
+            ? 0
+            : asset.size),
         0,
       );
       return `<tr><td><a href="${Bun.escapeHTML(prefix.slice(assetsPrefix.length))}">${Bun.escapeHTML(file)}</a></td><td>${assets.size}</td><td class="size">${formatSize(size)}</td></tr>`;
@@ -39,7 +44,7 @@ export function renderListing(
     const name = url.slice(prefix.length);
     return (
       `<tr><td><a href="${Bun.escapeHTML(assetUrl(name))}">${Bun.escapeHTML(name)}</a></td>` +
-      `<td class="size">${formatSize(asset.body.length)}</td>` +
+      `<td class="size">${formatSize(asset.size)}</td>` +
       `<td><time datetime="${asset.updated.toISOString()}">${dateFormat.format(asset.updated)}</time></td></tr>`
     );
   });

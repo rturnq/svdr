@@ -51,12 +51,36 @@ async function waitFor<T>(check: () => Promise<T | false | undefined>) {
 
 const wsScriptUrl = "/_svdr/ws.js";
 
+/** The hash a page's directory under the assets prefix is named by. */
+const entryHash = (dir: string, page: string) =>
+  entryPrefix(dir, path.join(dir, page)).slice("/_svdr/".length, -1);
+
+/** The script tag of a rendered page, which names the page's entry. */
+const entryScriptTag = (dir: string, page: string) =>
+  `<script type="module" src="${wsScriptUrl}?entry=${entryHash(dir, page)}"></script>`;
+
+/** Connects the way the script of a page of the given entry does. */
+async function connect(server: ServeDir, dir: string, page?: string) {
+  const messages: WsMessage[] = [];
+  const socket = new WebSocket(
+    server.url.replace("http", "ws") +
+      "/_svdr/ws" +
+      (page ? `?entry=${entryHash(dir, page)}` : ""),
+  );
+  socket.onmessage = (event) => messages.push(JSON.parse(event.data));
+  await new Promise((resolve, reject) => {
+    socket.onopen = resolve;
+    socket.onerror = reject;
+  });
+  return { socket, messages };
+}
+
 /** The URLs of the bundled files a page links to. */
 function bundledUrls(html: string) {
   return Array.from(
     html.matchAll(/(?:href|src)="(\/_svdr\/[^"]+)"/g),
     (match) => match[1]!,
-  ).filter((url) => url !== wsScriptUrl);
+  ).filter((url) => !url.startsWith(wsScriptUrl));
 }
 
 afterAll(async () => {
@@ -113,6 +137,33 @@ describe("static files", () => {
     expect((await ranged(new Date(0).toUTCString())).status).toBe(200);
     // Entity tags are weak and never match.
     expect((await ranged(etag)).status).toBe(200);
+  });
+
+  test("compresses a large file as it is read from disk", async () => {
+    const size = 17 * 1024 * 1024;
+    await writeFile(path.join(dir, "assets/big.txt"), "a".repeat(size));
+    const res = await get("/assets/big.txt", {
+      headers: { "accept-encoding": "gzip" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-encoding")).toBe("gzip");
+    expect(res.headers.get("content-length")).toBeNull();
+    expect((await res.text()).length).toBe(size);
+
+    const plain = await get("/assets/big.txt", {
+      headers: { "accept-encoding": "identity" },
+    });
+    expect(plain.headers.get("content-encoding")).toBeNull();
+    expect(plain.headers.get("content-length")).toBe(String(size));
+    await plain.body?.cancel();
+
+    const ranged = await get("/assets/big.txt", {
+      headers: { "accept-encoding": "gzip", range: "bytes=0-9" },
+    });
+    expect(ranged.status).toBe(206);
+    expect(ranged.headers.get("content-encoding")).toBeNull();
+    expect(await ranged.text()).toBe("aaaaaaaaaa");
+    await rm(path.join(dir, "assets/big.txt"));
   });
 
   test("does not serve missing, hidden, node_modules or outside files", async () => {
@@ -245,7 +296,7 @@ describe("pages", () => {
         ),
         ([, url]) => url!,
       )
-        .filter((url) => url !== wsScriptUrl)
+        .filter((url) => !url.startsWith(wsScriptUrl))
         .map((url) => get(url)),
     );
     expect(scripts.length).toBeGreaterThan(0);
@@ -463,6 +514,99 @@ describe("pages", () => {
     );
   });
 
+  test("serves the files pages refer to from disk, with ranges", async () => {
+    const clip = path.join(dir, "clip.mp4");
+    await writeFile(clip, "0123456789".repeat(300));
+    for (const name of ["media", "media2"]) {
+      await writeFile(
+        path.join(dir, `${name}.marko`),
+        'import clip from "./clip.mp4";\n<video src=clip/>\n',
+      );
+    }
+    const urlOf = async (page: string) => {
+      const html = await waitFor(async () => {
+        const res = await get(page);
+        return res.status === 200 && (await res.text());
+      });
+      return /src="?(\/_svdr\/[^" >]+\.mp4)/.exec(html)![1]!;
+    };
+    const url = await urlOf("/media");
+    const other = await urlOf("/media2");
+
+    // Each page has the file under its own directory, and neither holds it.
+    expect(other).not.toBe(url);
+    for (const assetUrl of [url, other]) {
+      const asset = server.bundler.assets.get(assetUrl)!;
+      expect("body" in asset).toBe(false);
+      expect(asset).toMatchObject({ file: clip, size: 3000 });
+    }
+
+    const full = await get(url);
+    expect(full.status).toBe(200);
+    expect(full.headers.get("content-type")).toBe("video/mp4");
+    expect(full.headers.get("accept-ranges")).toBe("bytes");
+    expect(full.headers.get("content-length")).toBe("3000");
+    expect(full.headers.get("cache-control")).toContain("immutable");
+    expect((await full.text()).length).toBe(3000);
+
+    const ranged = await get(url, { headers: { range: "bytes=10-14" } });
+    expect(ranged.status).toBe(206);
+    expect(ranged.headers.get("content-range")).toBe("bytes 10-14/3000");
+    expect(await ranged.text()).toBe("01234");
+    const fresh = await get(url, {
+      headers: { "if-none-match": full.headers.get("etag")! },
+    });
+    expect(fresh.status).toBe(304);
+
+    // A changed file gets a new URL; the old one stands for the old content.
+    await writeFile(clip, "9876543210".repeat(300));
+    const next = await waitFor(async () => {
+      const current = await urlOf("/media");
+      return current !== url && current;
+    });
+    expect((await get(url)).status).toBe(404);
+    expect(await (await get(next)).text()).toStartWith("9876543210");
+
+    for (const name of ["media.marko", "media2.marko", "clip.mp4"]) {
+      await rm(path.join(dir, name));
+    }
+    await waitFor(
+      async () => !server.bundler.pages.has(path.join(dir, "media2.marko")),
+    );
+  });
+
+  test("compresses the compressible files pages refer to", async () => {
+    await writeFile(
+      path.join(dir, "assets/icon.svg"),
+      `<svg xmlns="http://www.w3.org/2000/svg">${"<rect/>".repeat(300)}</svg>`,
+    );
+    await writeFile(
+      path.join(dir, "icon.marko"),
+      '<i class="icon"/>\n<style>\n  .icon { background: url(./assets/icon.svg) }\n</style>\n',
+    );
+    const html = await waitFor(async () => {
+      const res = await get("/icon");
+      return res.status === 200 && (await res.text());
+    });
+    const [sheet] = bundledUrls(html).filter((url) => url.endsWith(".css"));
+    const css = await (await get(sheet!)).text();
+    const icon = /url\("?(\/_svdr\/[^")]+\.svg)"?\)/.exec(css)![1]!;
+    const res = await get(icon, { headers: { "accept-encoding": "br" } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-encoding")).toBe("br");
+    expect(await res.text()).toContain("<rect/>");
+    const ranged = await get(icon, {
+      headers: { "accept-encoding": "br", range: "bytes=0-3" },
+    });
+    expect(ranged.status).toBe(206);
+    expect(ranged.headers.get("content-encoding")).toBeNull();
+    expect(await ranged.text()).toBe("<svg");
+    await rm(path.join(dir, "icon.marko"));
+    await waitFor(
+      async () => !server.bundler.pages.has(path.join(dir, "icon.marko")),
+    );
+  });
+
   test("isolates chunks between pages", async () => {
     await writeFile(
       path.join(dir, "other.marko"),
@@ -513,6 +657,23 @@ describe("bundled files", () => {
     expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
     const entries = await res.text();
     const prefix = entryPrefix(dir, path.join(dir, "index.marko"));
+    // The client size counts what a browser loads: no server bundle, no maps.
+    const clientSize = [...server.bundler.assets]
+      .filter(
+        ([url]) =>
+          url.startsWith(prefix) &&
+          !url.startsWith(prefix + "server/") &&
+          !url.endsWith(".map"),
+      )
+      .reduce((sum, [, asset]) => sum + asset.size, 0);
+    expect(
+      [...server.bundler.assets.keys()].some(
+        (url) => url.startsWith(prefix) && url.endsWith(".map"),
+      ),
+    ).toBe(true);
+    expect(entries).toContain(
+      `<td class="size">${(clientSize / 1024).toFixed(1)} kB</td>`,
+    );
     expect(entries).toContain(
       `href="${prefix.slice("/_svdr/".length)}">index.marko</a>`,
     );
@@ -560,7 +721,7 @@ describe("bundled files", () => {
     expect(files.some((url) => url.includes("about.client-entry"))).toBe(false);
     expect(files.some((url) => url.includes("about.server-entry"))).toBe(true);
     for (const asset of server.bundler.assets.values()) {
-      expect(asset.body.length).toBeGreaterThan(0);
+      expect(asset.size).toBeGreaterThan(0);
     }
     expect((await get("/_svdr/about.client-entry.js")).status).toBe(404);
   });
@@ -796,7 +957,8 @@ test("keeps serving the last working build while bundling fails", async () => {
     await writeFile(path.join(dir, "about.marko"), "<h1>Broken ${");
     await writeFile(path.join(dir, "new.marko"), "<p>New</p>\n");
     await waitFor(async () => errors.length > 0);
-    expect(errors[0]).toContain("Bundling failed, still serving");
+    expect(errors[0]).toContain("✗ about.marko");
+    expect(errors[0]).toContain("still serving its last working build");
 
     // Pages of the last working build are served as they were...
     expect(await text("/about")).toContain("<h1>About</h1>");
@@ -878,7 +1040,8 @@ test("keeps the last working build when a page fails to load", async () => {
       'throw new Error("boom");\nexport const greeting = () => "";\n',
     );
     await waitFor(async () => errors.length > 0);
-    expect(errors[0]).toContain("Bundling failed, still serving");
+    expect(errors[0]).toContain("✗ index.marko");
+    expect(errors[0]).toContain("still serving its last working build");
     expect(errors[0]).toContain("boom");
     expect(await (await fetch(server.url + "/")).text()).toBe(before);
   } finally {
@@ -886,15 +1049,58 @@ test("keeps the last working build when a page fails to load", async () => {
   }
 });
 
-test("shows the error when the first build fails", async () => {
+test("serves a page that never bundled empty, for its script to show the error", async () => {
   const dir = await createSite();
   await writeFile(path.join(dir, "about.marko"), "<h1>Broken ${");
   const server = await start(dir);
   try {
     const res = await fetch(server.url + "/about");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    const html = await res.text();
+    expect(html).toContain("<title>about.marko</title>");
+    expect(html).toContain(
+      `<body>\n${entryScriptTag(dir, "about.marko")}\n</body>`,
+    );
+    // Other pages and files are not affected.
+    expect(await (await fetch(server.url + "/")).text()).toContain("<h1>Hello");
+    expect((await fetch(server.url + "/assets/hello.txt")).status).toBe(200);
+
+    // The script is told the error as soon as it connects...
+    const page = await connect(server, dir, "about.marko");
+    try {
+      await waitFor(async () => page.messages.length > 0);
+      const [failed] = page.messages;
+      if (failed?.type !== "error") throw new Error(`Got ${failed?.type}`);
+      expect(failed.message).toStartWith("Bundling failed\n");
+      expect(failed.message).toContain("<h1>Broken ${");
+
+      // ...and to load the page once it bundles.
+      await writeFile(path.join(dir, "about.marko"), "<h1>Fixed</h1>\n");
+      await waitFor(async () => page.messages.length >= 3);
+      expect(page.messages.slice(1)).toEqual([
+        { type: "ok" },
+        { type: "reload" },
+      ]);
+      expect(await (await fetch(server.url + "/about")).text()).toContain(
+        "<h1>Fixed</h1>",
+      );
+    } finally {
+      page.socket.close();
+    }
+  } finally {
+    await server.stop();
+  }
+});
+
+test("responds with the error for a page that never bundled when there is no live reload", async () => {
+  const dir = await createSite();
+  await writeFile(path.join(dir, "about.marko"), "<h1>Broken ${");
+  const server = await start(dir, { hot: false });
+  try {
+    const res = await fetch(server.url + "/about");
     expect(res.status).toBe(500);
     expect(await res.text()).toContain("Error bundling about.marko");
-    expect((await fetch(server.url + "/assets/hello.txt")).status).toBe(200);
   } finally {
     await server.stop();
   }
@@ -912,8 +1118,7 @@ describe("live reload", () => {
     await waitFor(async () => received.length > 0);
     // Give messages that should not have been sent a chance to arrive.
     await Bun.sleep(150);
-    const messages = received;
-    received = [];
+    const messages = received.splice(0);
     expect(messages).toHaveLength(1);
     return messages[0]!;
   };
@@ -921,12 +1126,12 @@ describe("live reload", () => {
   beforeAll(async () => {
     dir = await createSite();
     server = await start(dir);
-    socket = new WebSocket(server.url.replace("http", "ws") + "/_svdr/ws");
-    socket.onmessage = (event) => received.push(JSON.parse(event.data));
-    await new Promise((resolve, reject) => {
-      socket.onopen = resolve;
-      socket.onerror = reject;
-    });
+    // A page rendered from index.marko.
+    ({ socket, messages: received } = await connect(
+      server,
+      dir,
+      "index.marko",
+    ));
   });
   afterAll(async () => {
     socket.close();
@@ -936,8 +1141,8 @@ describe("live reload", () => {
   const tag = `<script type="module" src="${wsScriptUrl}"></script>`;
 
   test("adds its script to every page", async () => {
-    expect(await text("/")).toContain(tag);
-    expect(await text("/about")).toContain(tag);
+    expect(await text("/")).toContain(entryScriptTag(dir, "index.marko"));
+    expect(await text("/about")).toContain(entryScriptTag(dir, "about.marko"));
 
     const script = await fetch(server.url + wsScriptUrl);
     expect(script.status).toBe(200);
@@ -952,7 +1157,7 @@ describe("live reload", () => {
     const html = "<!doctype html>\n<title>Plain</title>\n<p>Plain</p>\n";
     await writeFile(path.join(dir, "plain.html"), html);
     await Bun.sleep(150);
-    received = [];
+    received.length = 0;
 
     const res = await fetch(server.url + "/plain");
     expect(res.status).toBe(200);
@@ -1038,19 +1243,79 @@ describe("live reload", () => {
     expect(received).toEqual([]);
   });
 
+  test("only tells a page about its own entry", async () => {
+    // Another page that uses the same tag, and a page that does not.
+    await writeFile(
+      path.join(dir, "other.marko"),
+      "<h1>Other</h1>\n<counter/>\n",
+    );
+    await waitFor(async () =>
+      server.bundler.pages.has(path.join(dir, "other.marko")),
+    );
+    const other = await connect(server, dir, "other.marko");
+    const about = await connect(server, dir, "about.marko");
+    const plain = await connect(server, dir);
+    try {
+      received.length = 0;
+      const tag = path.join(dir, "tags/counter.marko");
+      await writeFile(
+        tag,
+        (await Bun.file(tag).text()).replace("0.5em 1em", "1em 2em"),
+      );
+      const forIndex = await message();
+      const [forOther] = other.messages;
+      for (const [update, page] of [
+        [forIndex, "index.marko"],
+        [forOther, "other.marko"],
+      ] as const) {
+        if (update?.type !== "styles") throw new Error(`Got ${update?.type}`);
+        // One stylesheet changed for the page, not one for every page.
+        expect(update.styles).toHaveLength(1);
+        const prefix = entryPrefix(dir, path.join(dir, page));
+        expect(update.styles[0]![0]).toStartWith(prefix);
+        expect(update.styles[0]![1]).toStartWith(prefix);
+      }
+      expect(other.messages).toHaveLength(1);
+      expect(about.messages).toEqual([]);
+      expect(plain.messages).toEqual([]);
+
+      // A change to one page does not reload the others.
+      await writeFile(
+        path.join(dir, "other.marko"),
+        "<h1>Changed</h1>\n<counter/>\n",
+      );
+      await waitFor(async () => other.messages.length > 1);
+      expect(other.messages[1]).toEqual({ type: "reload" });
+      await Bun.sleep(150);
+      expect(received).toEqual([]);
+      expect(about.messages).toEqual([]);
+    } finally {
+      other.socket.close();
+      about.socket.close();
+      plain.socket.close();
+    }
+  });
+
   test("reports a failed build without reloading", async () => {
-    const file = path.join(dir, "about.marko");
+    const file = path.join(dir, "index.marko");
     const source = await Bun.file(file).text();
     await writeFile(file, "<h1>Broken ${");
     const failed = await message();
     if (failed.type !== "error") throw new Error(`Got ${failed.type}`);
     expect(failed.message).toContain("Bundling failed");
 
-    // Fixing it gets back to what the page already shows.
+    // A page loaded while its entry is failing shows its last working
+    // build, and is told about the error when it connects.
+    expect(await text("/")).toContain("<h1>");
+    const late = await connect(server, dir, "index.marko");
+    await waitFor(async () => late.messages.length > 0);
+    expect(late.messages).toEqual([failed]);
+    late.socket.close();
+
+    // Fixing it gets back to what the page already shows, so all there is
+    // to tell the page is that the error is over.
     await writeFile(file, source);
-    await Bun.sleep(400);
-    await server.bundler.settled;
-    expect(received).toEqual([]);
+    expect(await message()).toEqual({ type: "ok" });
   });
 });
 
@@ -1072,12 +1337,109 @@ test("live reload can be turned off, and on in production", async () => {
 
     const on = await start(dir, { prod, hot: true });
     try {
-      expect(await (await fetch(on.url + "/")).text()).toContain(tag);
+      expect(await (await fetch(on.url + "/")).text()).toContain(
+        entryScriptTag(dir, "index.marko"),
+      );
       expect((await fetch(on.url + wsScriptUrl)).status).toBe(200);
       expect((await fetch(on.url + "/_svdr/ws")).status).toBe(426);
     } finally {
       await on.stop();
     }
+  }
+});
+
+test("logs what changed, what is bundled because of it, and the result", async () => {
+  const dir = await createSite();
+  const lines: string[] = [];
+  const log = (message: string) => lines.push(...message.split("\n"));
+  const server = await start(dir, {}, { info: log, error: log });
+  /** The lines logged for one change, up to the blank line that ends them. */
+  const batch = async (change: () => Promise<void>) => {
+    lines.length = 0;
+    await change();
+    await waitFor(async () => lines.includes(""));
+    return lines
+      .slice(0, lines.indexOf(""))
+      .map((line) => line.replace(/\(\d+ms\)/, "(ms)"));
+  };
+  try {
+    expect(
+      lines.map((line) => line.replace(/\(\d+ms\)/, "(ms)")).sort(),
+    ).toEqual([
+      "  ✓ about.marko (ms)",
+      "  ✓ index.marko (ms)",
+      "↻ bundling 2 entries",
+    ]);
+
+    expect(
+      await batch(() =>
+        writeFile(
+          path.join(dir, "tags/counter.marko"),
+          "<button>changed</button>\n",
+        ),
+      ),
+    ).toEqual([
+      "~ tags/counter.marko",
+      "↻ bundling 1 entry",
+      "  ✓ index.marko (ms)",
+    ]);
+
+    const failed = await batch(() =>
+      writeFile(path.join(dir, "fresh.marko"), "<p>Broken ${"),
+    );
+    expect(failed.slice(0, 3)).toEqual([
+      "+ fresh.marko",
+      "↻ bundling 1 entry",
+      "  ✗ fresh.marko (ms)",
+    ]);
+    // The error belongs to the entry above it: where, and one code frame.
+    expect(failed.slice(3)).toEqual([
+      expect.stringMatching(/^  at \S*fresh\.marko:1:13$/),
+      "  > 1 | <p>Broken ${",
+      "      |             ^ EOF reached while parsing placeholder",
+    ]);
+
+    expect(await batch(() => rm(path.join(dir, "fresh.marko")))).toEqual([
+      "- fresh.marko",
+    ]);
+
+    const broken = await batch(() =>
+      writeFile(path.join(dir, "about.marko"), "<h1>Broken ${"),
+    );
+    expect(broken.slice(0, 3)).toEqual([
+      "~ about.marko",
+      "↻ bundling 1 entry",
+      "  ✗ about.marko (ms), still serving its last working build",
+    ]);
+
+    // Any change retries an entry that failed, here while fixing it.
+    expect(
+      await batch(() =>
+        writeFile(path.join(dir, "about.marko"), "<h1>About</h1>\n"),
+      ),
+    ).toEqual(["~ about.marko", "↻ bundling 1 entry", "  ✓ about.marko (ms)"]);
+
+    // A file that is not part of any bundle.
+    expect(
+      await batch(() =>
+        writeFile(path.join(dir, "assets/hello.txt"), "changed\n"),
+      ),
+    ).toEqual(["~ assets/hello.txt"]);
+
+    // A page that goes away with its directory is reported as removed.
+    await batch(async () => {
+      await mkdir(path.join(dir, "docs"));
+      await writeFile(path.join(dir, "docs/page.marko"), "<p>doc</p>\n");
+    });
+    const removed = await batch(() =>
+      rm(path.join(dir, "docs"), { recursive: true }),
+    );
+    expect(removed).toContain("- docs/page.marko");
+    expect(removed.filter((line) => line === "- docs/page.marko")).toHaveLength(
+      1,
+    );
+  } finally {
+    await server.stop();
   }
 });
 

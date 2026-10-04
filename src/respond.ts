@@ -109,17 +109,44 @@ export function redirectToDirectory(
 }
 
 const stackFrameReg = /^\s+at (?:.+ \(.+\)|(?:\/|file:|node:|native).*)$/;
+/** A line of a code frame: `> 1 | code`, `  2 | code` or `    | ^ message`. */
+const codeFrameReg = /^\s*(?:>\s*)?(?:\d+\s)?\|/;
 
-/** Describes an error, by default without the stack frames that are part of its message. */
+/**
+ * Describes an error, by default briefly: without the stack frames that are
+ * part of its message and, when it points into a file, with just the first
+ * code frame and where it is. The compiler's errors come wrapped by the
+ * bundler, which repeats the same frame several times.
+ */
 export function errorMessage(error: unknown, stack = false): string {
   const { message, stack: trace } = error as Error;
   const text = stripVTControlCharacters(
     String((stack && trace) || message || error),
   );
   if (stack) return text;
-  return text
-    .split("\n")
-    .filter((line) => !stackFrameReg.test(line))
-    .join("\n")
-    .trim();
+  const lines = text.split("\n").filter((line) => !stackFrameReg.test(line));
+  const start = lines.findIndex((line) => codeFrameReg.test(line));
+  if (start === -1) return lines.join("\n").trim();
+
+  // The frame ends where the frame lines do, or where a repetition of it
+  // starts further to the left.
+  const indentOf = (line: string) => /^\s*/.exec(line)![0].length;
+  const hasLocation = /^\s*at \S+:\d+:\d+$/.test(lines[start - 1] ?? "");
+  const base = hasLocation
+    ? indentOf(lines[start - 1]!)
+    : Math.min(
+        indentOf(lines[start]!),
+        indentOf(lines[start + 1] ?? lines[start]!),
+      );
+  let end = start;
+  while (
+    end < lines.length &&
+    codeFrameReg.test(lines[end]!) &&
+    indentOf(lines[end]!) >= base
+  ) {
+    end++;
+  }
+  const frame = lines.slice(hasLocation ? start - 1 : start, end);
+  const indent = Math.min(...frame.map(indentOf));
+  return frame.map((line) => line.slice(indent)).join("\n");
 }

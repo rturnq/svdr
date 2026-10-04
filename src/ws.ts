@@ -22,26 +22,30 @@ export type WsMessage =
       /** URL paths of stylesheets in the served directory that changed. */
       files: string[];
     }
-  | { type: "error"; message: string };
+  /** The page's entry failed to bundle; what it shows is its last working build. */
+  | { type: "error"; message: string }
+  /** The page's entry bundles again. */
+  | { type: "ok" };
+
+export interface Notice {
+  /** The entry directory whose pages the message is for; all pages without one. */
+  entry?: string;
+  message: WsMessage;
+}
 
 /**
  * Works out what pages have to do about the given changed paths, after the
- * bundler has dealt with them.
+ * bundler has dealt with them. What happened to an entry only concerns the
+ * pages of that entry; a file that is served as it is may be shown by any
+ * page.
  */
 export async function messagesFor(
   root: string,
   paths: Iterable<string>,
   { build, bundled }: UpdateResult,
   describeError: (error: Error) => string,
-): Promise<WsMessage[]> {
-  const messages: WsMessage[] = [];
-  if (build?.error) {
-    messages.push({ type: "error", message: describeError(build.error) });
-  }
-
-  // Changes to what is bundled show in the build, any other file that
-  // changed may be one a page shows as it is.
-  let reload = build?.changes.reload ?? false;
+): Promise<Notice[]> {
+  let reload = false;
   const files: string[] = [];
   for (const changedPath of paths) {
     if (reload) break;
@@ -62,10 +66,29 @@ export async function messagesFor(
     }
   }
 
-  const styles = build?.changes.styles ?? [];
-  if (reload) messages.push({ type: "reload" });
-  else if (styles.length || files.length) {
-    messages.push({ type: "styles", styles, files });
+  const notices: Notice[] = [];
+  for (const [entry, { changes, error, recovered }] of build?.entries ?? []) {
+    if (error) {
+      notices.push({
+        entry,
+        message: { type: "error", message: describeError(error) },
+      });
+    }
+    // Even when the page needs nothing else, the error it shows is over.
+    if (recovered) notices.push({ entry, message: { type: "ok" } });
+    if (reload) continue;
+    if (changes.reload) {
+      notices.push({ entry, message: { type: "reload" } });
+    } else if (changes.styles.length) {
+      notices.push({
+        entry,
+        message: { type: "styles", styles: changes.styles, files: [] },
+      });
+    }
   }
-  return messages;
+  if (reload) notices.push({ message: { type: "reload" } });
+  else if (files.length) {
+    notices.push({ message: { type: "styles", styles: [], files } });
+  }
+  return notices;
 }

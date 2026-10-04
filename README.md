@@ -63,7 +63,9 @@ Local stylesheet `@import`s are inlined (package stylesheets can be imported
 by name). When an import chain includes a remote stylesheet, local dependencies
 are emitted into the page's asset directory and the import chain is preserved,
 including its order, conditions, and layers. Relative `url()` assets and assets
-imported from JavaScript are also emitted there. Root-relative and remote URLs
+imported from JavaScript are also served from there, under a name with a hash
+of their content. They are not copied: they are read from where they are, so
+they support byte ranges like any other file. Root-relative and remote URLs
 keep their original meaning. CSS Modules (`<style/styles>` blocks and
 `.module.css` files) are supported; other style languages are not.
 
@@ -85,9 +87,16 @@ discovery or package mappings can require rebuilding other pages too. Independen
 builds run with bounded concurrency and publish as each page finishes. Existing
 pages remain available while builds run.
 
+The terminal shows each file that was changed, added or removed, the entries
+that are bundled because of it with the reason for each, and how each entry
+went. A request for a page that is being bundled for the first time waits for
+it.
+
 When an entry fails, its error is logged and its own last working build remains
-available. Other entries can still publish successful builds. Only pages that
-have never built successfully respond with the error. `--prod` keeps the same
+available. Other entries can still publish successful builds. A page that has
+never built successfully is served empty, for the notice below to show the
+error and to load the page once it builds; without live reload it responds
+with the error instead. `--prod` keeps the same
 independent build model with minification, stronger compression, and no source
 maps.
 
@@ -101,8 +110,9 @@ date as files change:
   the page links to, the stylesheets are swapped in place and the page keeps
   its state.
 - When anything else a page may show changed, the page reloads.
-- When bundling fails, the error is logged to the browser console and the
-  page stays as it is.
+- When bundling fails, the page stays as it is and shows the error in a
+  dismissable notice at the top, which goes away once the page bundles
+  again. The error is logged to the browser console as well.
 
 Plain `.html` files take part too: the script that connects them is
 appended to them as they are served.
