@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# One release at a time, and never cancelled half way through publishing.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  # npm trusts this workflow to publish the package (trusted publishing),
+  # which it verifies with a token GitHub issues for the run. No npm token
+  # is stored in the repository.
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or newer.
+      - run: npm install -g npm@latest
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      # With changesets on main, opens or updates the pull request that
+      # applies them. Once that is merged, publishes the new version.
+      - uses: changesets/action@v1
+        with:
+          version: bun run version
+          publish: bun run release
+          title: "chore: release"
+          commit: "chore: release"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

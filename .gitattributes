@@ -1,0 +1,2 @@
+# The same line endings everywhere: tests compare file contents byte for byte.
+* text=auto eol=lf
