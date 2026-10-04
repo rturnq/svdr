@@ -12,7 +12,7 @@ HTTPS and HTTP/2 are enabled by default.
 Requires [Bun](https://bun.sh) 1.4.1 or newer.
 
 ```sh
-bun install -g svdr
+bun install -g @svdr/cli
 cd ~/my-site
 svdr
 ```

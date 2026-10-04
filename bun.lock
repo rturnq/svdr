@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "svdr",
+      "name": "@svdr/cli",
       "dependencies": {
         "@marko/compiler": "^5.42.10",
         "lightningcss": "^1.33.0",
