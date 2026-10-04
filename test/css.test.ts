@@ -156,6 +156,10 @@ test("survives unfinished input", () => {
   }
 });
 
+/** A relative path with forward slashes, whatever the platform uses. */
+const relative = (from: string, to: string) =>
+  path.relative(from, to).split(path.sep).join("/");
+
 const tmpDirs: string[] = [];
 afterAll(() =>
   Promise.all(tmpDirs.map((dir) => rm(dir, { recursive: true, force: true }))),
@@ -205,7 +209,7 @@ test("inlines local imports with their urls made relative to the root", async ()
   expect(css).toMatch(/@media print\s*{/);
   expect(css.indexOf(".x")).toBeLessThan(css.indexOf(".base"));
   expect(css.indexOf(".base")).toBeLessThan(css.indexOf("body"));
-  expect(files.map((file) => path.relative(root, file)).sort()).toEqual([
+  expect(files.map((file) => relative(root, file)).sort()).toEqual([
     "docs/print.css",
     "styles/base.css",
     "styles/deep/x.css",
@@ -289,7 +293,7 @@ test("serves files a stylesheet refers to that cannot be served from where they 
     cssModules: false,
     emitAsset(file) {
       if (!existsSync(file)) return null;
-      emitted.push(path.relative(root, file));
+      emitted.push(relative(root, file));
       return `/_svdr/assets/${path.basename(file)}`;
     },
   });
@@ -326,7 +330,7 @@ test("enters packages through their exports", async () => {
   });
   const find = (specifier: string) => {
     const file = findPackageStylesheet(specifier, [root]);
-    return file && path.relative(root, file);
+    return file && relative(root, file);
   };
   expect(find("exported")).toBe("node_modules/exported/dist/main.css");
   expect(find("exported/theme")).toBe("node_modules/exported/dist/theme.css");
@@ -411,7 +415,7 @@ test("leaves url() imports to the bundler", async () => {
     root,
     cssModules: false,
     emitAsset(file) {
-      emitted.push(path.relative(root, file));
+      emitted.push(relative(root, file));
       return `/_svdr/assets/${path.basename(file)}`;
     },
   });
@@ -435,7 +439,7 @@ test("serves assets of packages above the served directory", async () => {
     root,
     cssModules: false,
     emitAsset(file) {
-      emitted.push(path.relative(project, file));
+      emitted.push(relative(project, file));
       return `/_svdr/assets/${path.basename(file)}`;
     },
   });
@@ -461,7 +465,7 @@ test("resolves a linked package's imports from where it really is", async () => 
   const { css, files } = await bundle(root, "page.css");
   expect(css).toContain("version: own");
   expect(css).not.toContain("version: site");
-  expect(files.map((file) => path.relative(project, file))).toEqual([
+  expect(files.map((file) => relative(project, file))).toEqual([
     "pkgs/linked/linked.css",
     "pkgs/linked/node_modules/dep/index.css",
   ]);
@@ -476,9 +480,9 @@ test("picks the most specific export pattern", async () => {
     "node_modules/pkg/generic/theme/dark.css": ".generic {}",
     "node_modules/pkg/themes/dark.css": ".theme {}",
   });
-  expect(
-    path.relative(root, findPackageStylesheet("pkg/theme/dark", [root])!),
-  ).toBe("node_modules/pkg/themes/dark.css");
+  expect(relative(root, findPackageStylesheet("pkg/theme/dark", [root])!)).toBe(
+    "node_modules/pkg/themes/dark.css",
+  );
 });
 
 test("retains each repeated import and every path through a shared dependency", async () => {

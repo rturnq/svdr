@@ -57,7 +57,9 @@ export async function serveDir(
   // Resolved, so that files reached through symlinks can be told apart from
   // files that are inside the directory.
   const root = await realpath(options.dir);
-  const relative = (file: string) => path.relative(root, file);
+  /** A path within the served directory, written the way its URL is. */
+  const relative = (file: string) =>
+    path.relative(root, file).split(path.sep).join("/");
   const { hot } = options;
 
   /** The removed files logged for the changes being handled. */

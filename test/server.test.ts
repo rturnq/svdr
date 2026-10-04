@@ -92,6 +92,23 @@ function bundledUrls(html: string) {
   ).filter((url) => !url.startsWith(wsScriptUrl));
 }
 
+/**
+ * Waits for a page to be bundled and returns its html. A page that has not
+ * bundled yet, for instance because the tags it uses are still being
+ * written, is served empty for its script to show the error.
+ */
+function rendered(
+  get: (pathname: string) => Promise<Response>,
+  pathname: string,
+) {
+  return waitFor(async () => {
+    const res = await get(pathname);
+    if (res.status !== 200) return false;
+    const html = await res.text();
+    return !/<body>\n<script[^>]*><\/script>\n<\/body>/.test(html) && html;
+  });
+}
+
 afterAll(async () => {
   await Promise.all(
     tmpDirs.map((dir) => rm(dir, { recursive: true, force: true })),
@@ -379,10 +396,7 @@ describe("pages", () => {
 </style>
 `,
     );
-    const html = await waitFor(async () => {
-      const res = await get("/docs/styled");
-      return res.status === 200 && (await res.text());
-    });
+    const html = await rendered(get, "/docs/styled");
     const [style] = bundledUrls(html).filter((url) => url.endsWith(".css"));
     const css = await (await get(style!)).text();
     expect(css).toContain("url(/assets/bg.svg)");
@@ -397,10 +411,7 @@ describe("pages", () => {
       );
     }
     const order = async (pathname: string) => {
-      const html = await waitFor(async () => {
-        const res = await get(pathname);
-        return res.status === 200 && (await res.text());
-      });
+      const html = await rendered(get, pathname);
       const sheets = bundledUrls(html).filter((url) => url.endsWith(".css"));
       const css = (
         await Promise.all(sheets.map(async (url) => (await get(url)).text()))
@@ -424,7 +435,7 @@ describe("pages", () => {
     const alone = await order("/one");
     expect(alone).toHaveLength(3);
     await writeFile(path.join(dir, "two.marko"), "<ta/>\n<tb/>\n");
-    await waitFor(async () => (await get("/two")).status === 200);
+    await rendered(get, "/two");
     expect(await order("/one")).toEqual(alone);
     const together = await order("/two");
     expect(together).toHaveLength(2);
@@ -456,10 +467,7 @@ describe("pages", () => {
       path.join(dir, "lazy-b.marko"),
       'import { later } from "./later.js";\n<button onClick() { later(); }>later</button>\n',
     );
-    const html = await waitFor(async () => {
-      const res = await get("/lazy-b");
-      return res.status === 200 && (await res.text());
-    });
+    const html = await rendered(get, "/lazy-b");
     const sheets = bundledUrls(html).filter((url) => url.endsWith(".css"));
     const css = (
       await Promise.all(sheets.map(async (url) => (await get(url)).text()))
@@ -480,10 +488,7 @@ describe("pages", () => {
       path.join(dir, "hash#page.marko"),
       "<p>Hash</p>\n<style>\n  p { color: hashred; }\n</style>\n",
     );
-    const html = await waitFor(async () => {
-      const res = await get("/hash%23page");
-      return res.status === 200 && (await res.text());
-    });
+    const html = await rendered(get, "/hash%23page");
     const [href] = Array.from(
       html.matchAll(/<link rel="stylesheet" href="([^"]+)">/g),
       (match) => match[1]!,
@@ -513,10 +518,7 @@ describe("pages", () => {
 <div class=shared.shared>shared</div>
 `,
     );
-    const html = await waitFor(async () => {
-      const res = await get("/modules");
-      return res.status === 200 && (await res.text());
-    });
+    const html = await rendered(get, "/modules");
     const classes = Array.from(
       html.matchAll(/<div class="?([^">]+)"?>/g),
       (match) => match[1]!,
@@ -554,10 +556,7 @@ describe("pages", () => {
       );
     }
     const urlOf = async (page: string) => {
-      const html = await waitFor(async () => {
-        const res = await get(page);
-        return res.status === 200 && (await res.text());
-      });
+      const html = await rendered(get, page);
       return /src="?(\/_svdr\/[^" >]+\.mp4)/.exec(html)![1]!;
     };
     const url = await urlOf("/media");
@@ -614,10 +613,7 @@ describe("pages", () => {
       path.join(dir, "icon.marko"),
       '<i class="icon"/>\n<style>\n  .icon { background: url(./assets/icon.svg) }\n</style>\n',
     );
-    const html = await waitFor(async () => {
-      const res = await get("/icon");
-      return res.status === 200 && (await res.text());
-    });
+    const html = await rendered(get, "/icon");
     const [sheet] = bundledUrls(html).filter((url) => url.endsWith(".css"));
     const css = await (await get(sheet!)).text();
     const icon = /url\("?(\/_svdr\/[^")]+\.svg)"?\)/.exec(css)![1]!;
@@ -642,10 +638,7 @@ describe("pages", () => {
       path.join(dir, "other.marko"),
       "<h1>Other</h1>\n<counter/>\n",
     );
-    const other = await waitFor(async () => {
-      const res = await get("/other");
-      return res.status === 200 && (await res.text());
-    });
+    const other = await rendered(get, "/other");
     const index = await (await get("/")).text();
     const assets = bundledUrls;
     const shared = assets(index).filter((url) => assets(other).includes(url));
@@ -826,10 +819,7 @@ describe("watching", () => {
     );
     await writeFile(path.join(dir, "conv.marko"), "<card>hi</card>\n");
     const styles = async () => {
-      const html = await waitFor(async () => {
-        const res = await get("/conv");
-        return res.status === 200 && (await res.text());
-      });
+      const html = await rendered(get, "/conv");
       const sheets = bundledUrls(html).filter((url) => url.endsWith(".css"));
       return (
         await Promise.all(sheets.map(async (url) => (await get(url)).text()))
@@ -861,10 +851,7 @@ describe("watching", () => {
       '<p class="theme">t</p>\n<style>\n  @import "./styles/theme.css";\n  p { margin: 0 }\n</style>\n',
     );
     const styles = async () => {
-      const html = await waitFor(async () => {
-        const res = await get("/imports");
-        return res.status === 200 && (await res.text());
-      });
+      const html = await rendered(get, "/imports");
       const sheets = bundledUrls(html).filter((url) => url.endsWith(".css"));
       return (
         await Promise.all(sheets.map(async (url) => (await get(url)).text()))
@@ -894,10 +881,7 @@ describe("watching", () => {
       '<b>s</b>\n<style>\n  @import "https://fonts.example/f.css";\n  .second { color: blue }\n</style>\n',
     );
     await writeFile(path.join(dir, "remote.marko"), "<first/>\n<second/>\n");
-    const html = await waitFor(async () => {
-      const res = await get("/remote");
-      return res.status === 200 && (await res.text());
-    });
+    const html = await rendered(get, "/remote");
     for (const url of bundledUrls(html).filter((u) => u.endsWith(".css"))) {
       const css = await (await get(url)).text();
       const imports = css.match(/@import/g) ?? [];
@@ -929,10 +913,7 @@ describe("watching", () => {
       path.join(dir, "fonts.marko"),
       '<p>f</p>\n<style>\n  @import "fonts";\n</style>\n',
     );
-    const html = await waitFor(async () => {
-      const res = await get("/fonts");
-      return res.status === 200 && (await res.text());
-    });
+    const html = await rendered(get, "/fonts");
     const [sheet] = bundledUrls(html).filter((u) => u.endsWith(".css"));
     const css = await (await get(sheet!)).text();
     const [, font] =
