@@ -9,7 +9,7 @@
   },
   "type": "module",
   "bin": {
-    "svdr": "./src/cli.ts"
+    "svdr": "src/cli.ts"
   },
   "files": [
     "src"
