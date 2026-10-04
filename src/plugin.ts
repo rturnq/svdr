@@ -232,7 +232,10 @@ export function markoPlugins(opts: MarkoPluginOptions): {
           return tagDef && (tagDef.template || tagDef.renderer);
         }
 
-        if (source[0] === ".") {
+        // The stylesheet of a `<style>` block only exists here. It is
+        // imported relative to its template, or by its full path: that is
+        // how the compiler writes the import into a page's entry on Windows.
+        if (source[0] === "." || path.isAbsolute(source)) {
           const resolved = path.resolve(importer, "..", source);
           return virtualFiles.has(resolved) ? resolved : null;
         }
