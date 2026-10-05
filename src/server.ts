@@ -211,7 +211,8 @@ export async function serveDir(
     if (options.compression.length) headers.set("vary", "accept-encoding");
 
     const prefix = entryPrefix(root, file);
-    const script = `<script type="module" src="${wsScriptPath}?entry=${prefix.slice(assetsPrefix.length, -1)}"></script>`;
+    const scriptSrc = `src="${wsScriptPath}?entry=${prefix.slice(assetsPrefix.length, -1)}"`;
+    const script = `<script type="module" ${scriptSrc}></script>`;
     /** Tells the page's script about an error that only this request ran into. */
     const errorTag = (error: unknown) =>
       `<meta name="${wsErrorName}" content="${Bun.escapeHTML(`Rendering failed\n${errorMessage(error)}`)}">`;
@@ -238,16 +239,38 @@ ${script}
 
     const logError = (error: unknown) =>
       log.error(`✗ ${relative(file)}\n${errorMessage(error, true)}`);
+    // Whether the page has loaded its script by the time it fails decides
+    // whether the error has to bring one along.
+    let sent = "";
+    let hasScript = false;
+    const watchForScript = new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        if (!hasScript) {
+          // The tag may be split over two chunks.
+          sent =
+            sent.slice(-scriptSrc.length) +
+            Buffer.from(chunk).toString("latin1");
+          hasScript = sent.includes(scriptSrc);
+        }
+        controller.enqueue(chunk);
+      },
+    });
     let body: ReadableStream<Uint8Array>;
     try {
       if (!page.template) throw page.error;
+      const rendered = page.template
+        .render({ $global: { request: req } })
+        .toReadable();
       body = await primed(
-        page.template.render({ $global: { request: req } }).toReadable(),
+        hot ? rendered.pipeThrough(watchForScript) : rendered,
         // Part of the page has been sent. With live reload the rest is
         // replaced by the error, for the script to show.
         (error) => {
           logError(error);
-          if (hot) return Buffer.from(`\n${errorTag(error)}\n${script}\n`);
+          if (!hot) return;
+          return Buffer.from(
+            `\n${errorTag(error)}\n${hasScript ? "" : `${script}\n`}`,
+          );
         },
       );
     } catch (error) {

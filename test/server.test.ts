@@ -1163,7 +1163,7 @@ test("ends a page that fails after it started rendering with the error", async (
   const dir = await createSite();
   await writeFile(
     path.join(dir, "about.marko"),
-    'static const late = () =>\n  new Promise((_, reject) => setTimeout(() => reject(new Error("late")), 50));\n<h1>Started</h1>\n<await|value|=late()>${value}</await>\n',
+    'static const late = () =>\n  new Promise((_, reject) => setTimeout(() => reject(new Error("late")), 50));\n<!doctype html>\n<html>\n<head><title>About</title></head>\n<body>\n<h1>Started</h1>\n<await|value|=late()>${value}</await>\n</body>\n</html>\n',
   );
   const lines: string[] = [];
   const log = (message: string) => lines.push(message);
@@ -1173,10 +1173,27 @@ test("ends a page that fails after it started rendering with the error", async (
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("<h1>Started</h1>");
-    expect(html).toEndWith(
-      `\n<meta name="svdr-error" content="Rendering failed\nlate">\n${entryScriptTag(dir, "about.marko")}\n`,
-    );
+    const meta =
+      '\n<meta name="svdr-error" content="Rendering failed\nlate">\n';
+    const script = entryScriptTag(dir, "about.marko");
+    // The script was already sent with the head, and is not sent again.
+    expect(html).toEndWith(meta);
+    expect(html.split(script)).toHaveLength(2);
+    expect(html.indexOf(script)).toBeLessThan(html.indexOf("</head>"));
     expect(lines.some((line) => line.startsWith("✗ about.marko\n"))).toBe(true);
+
+    // A page without a head has its script once as well.
+    await writeFile(
+      path.join(dir, "bare.marko"),
+      'static const late = () =>\n  new Promise((_, reject) => setTimeout(() => reject(new Error("late")), 50));\n<h1>Started</h1>\n<await|value|=late()>${value}</await>\n',
+    );
+    await waitFor(async () =>
+      server.bundler.pages.has(path.join(dir, "bare.marko")),
+    );
+    const bare = await (await fetch(server.url + "/bare")).text();
+    expect(bare).toContain("<h1>Started</h1>");
+    expect(bare).toContain(meta);
+    expect(bare.split(entryScriptTag(dir, "bare.marko"))).toHaveLength(2);
   } finally {
     await server.stop();
   }
