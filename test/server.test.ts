@@ -1126,8 +1126,9 @@ test("serves a page that fails to render empty, with the error for its script to
     expect(res.status).toBe(500);
     expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
     const html = await res.text();
-    expect(html).toContain(
-      '<meta name="svdr-error" content="Rendering failed\nboom &lt;now&gt;">',
+    // The title says nothing was rendered; the rest is the error's stack.
+    expect(html).toMatch(
+      /<meta name="svdr-error" content="Rendering failed\nError: boom &lt;now&gt;\n +at fail \([^"]+">\n<\/head>/,
     );
     expect(html).toContain(script);
     expect(lines.some((line) => line.startsWith("✗ about.marko\n"))).toBe(true);
@@ -1174,10 +1175,10 @@ test("ends a page that fails after it started rendering with the error", async (
     const html = await res.text();
     expect(html).toContain("<h1>Started</h1>");
     const meta =
-      '\n<meta name="svdr-error" content="Rendering failed\nlate">\n';
+      /\n<meta name="svdr-error" content="Rendering failed mid-stream\nError: late\n +at [^"]+">\n$/;
     const script = entryScriptTag(dir, "about.marko");
     // The script was already sent with the head, and is not sent again.
-    expect(html).toEndWith(meta);
+    expect(html).toMatch(meta);
     expect(html.split(script)).toHaveLength(2);
     expect(html.indexOf(script)).toBeLessThan(html.indexOf("</head>"));
     expect(lines.some((line) => line.startsWith("✗ about.marko\n"))).toBe(true);
@@ -1192,7 +1193,7 @@ test("ends a page that fails after it started rendering with the error", async (
     );
     const bare = await (await fetch(server.url + "/bare")).text();
     expect(bare).toContain("<h1>Started</h1>");
-    expect(bare).toContain(meta);
+    expect(bare).toMatch(meta);
     expect(bare.split(entryScriptTag(dir, "bare.marko"))).toHaveLength(2);
   } finally {
     await server.stop();

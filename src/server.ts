@@ -213,16 +213,19 @@ export async function serveDir(
     const prefix = entryPrefix(root, file);
     const scriptSrc = `src="${wsScriptPath}?entry=${prefix.slice(assetsPrefix.length, -1)}"`;
     const script = `<script type="module" ${scriptSrc}></script>`;
-    /** Tells the page's script about an error that only this request ran into. */
-    const errorTag = (error: unknown) =>
-      `<meta name="${wsErrorName}" content="${Bun.escapeHTML(`Rendering failed\n${errorMessage(error)}`)}">`;
+    /**
+     * Tells the page's script about an error that only this request ran
+     * into: whether any of the page got out before it, and its stack.
+     */
+    const errorTag = (error: unknown, started: boolean) =>
+      `<meta name="${wsErrorName}" content="${Bun.escapeHTML(`${started ? "Rendering failed mid-stream" : "Rendering failed"}\n${errorMessage(error, true)}`)}">`;
     /** A page with nothing but the script, which shows what went wrong. */
     const emptyPage = (error?: unknown) =>
       Buffer.from(`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>${Bun.escapeHTML(relative(file))}</title>${error === undefined ? "" : `\n${errorTag(error)}`}
+<title>${Bun.escapeHTML(relative(file))}</title>${error === undefined ? "" : `\n${errorTag(error, false)}`}
 </head>
 <body>
 ${script}
@@ -269,7 +272,7 @@ ${script}
           logError(error);
           if (!hot) return;
           return Buffer.from(
-            `\n${errorTag(error)}\n${hasScript ? "" : `${script}\n`}`,
+            `\n${errorTag(error, true)}\n${hasScript ? "" : `${script}\n`}`,
           );
         },
       );
