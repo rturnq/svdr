@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import pkg from "../package.json" with { type: "json" };
 import { parseOptions, usage, UsageError } from "./options.ts";
 import { serveDir } from "./server.ts";
 
@@ -12,8 +13,12 @@ async function main() {
     return 1;
   }
 
-  if (!options) {
+  if (options === "help") {
     console.log(usage);
+    return 0;
+  }
+  if (options === "version") {
+    console.log(pkg.version);
     return 0;
   }
 

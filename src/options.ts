@@ -35,13 +35,17 @@ Options:
                             (default: on, or off with --prod)
       --http                Serve plain HTTP instead of HTTPS
       --prod                Minified bundles, stronger compression, no source maps
+  -v, --version             Print the version
       --help                Show this help
 `;
 
 export class UsageError extends Error {}
 
-/** Parses command line arguments; returns `null` when help was requested. */
-export function parseOptions(argv: string[]): Options | null {
+/**
+ * Parses command line arguments. Asking for the help or the version is
+ * answered instead of options.
+ */
+export function parseOptions(argv: string[]): Options | "help" | "version" {
   let values;
   try {
     ({ values } = parseArgs({
@@ -55,13 +59,15 @@ export function parseOptions(argv: string[]): Options | null {
         http: { type: "boolean", default: false },
         prod: { type: "boolean", default: false },
         help: { type: "boolean", default: false },
+        version: { type: "boolean", short: "v", default: false },
       },
     }));
   } catch (err) {
     throw new UsageError((err as Error).message);
   }
 
-  if (values.help) return null;
+  if (values.help) return "help";
+  if (values.version) return "version";
 
   const dir = path.resolve(values.dir);
   if (!statSync(dir, { throwIfNoEntry: false })?.isDirectory()) {

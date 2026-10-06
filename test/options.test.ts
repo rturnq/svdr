@@ -1,7 +1,12 @@
 import { expect, test } from "bun:test";
 import path from "node:path";
 import { negotiate, parseCompression } from "../src/compression.ts";
-import { parseExtensions, parseOptions, UsageError } from "../src/options.ts";
+import {
+  parseExtensions,
+  parseOptions,
+  UsageError,
+  type Options,
+} from "../src/options.ts";
 
 test("defaults", () => {
   expect(parseOptions([])).toEqual({
@@ -16,7 +21,7 @@ test("defaults", () => {
 });
 
 test("hot is on by default, except in production", () => {
-  const hot = (...argv: string[]) => parseOptions(argv)!.hot;
+  const hot = (...argv: string[]) => (parseOptions(argv) as Options).hot;
   expect(hot()).toBe(true);
   expect(hot("--prod")).toBe(false);
 
@@ -65,7 +70,12 @@ test("flags", () => {
 });
 
 test("help", () => {
-  expect(parseOptions(["--help"])).toBeNull();
+  expect(parseOptions(["--help"])).toBe("help");
+});
+
+test("version", () => {
+  expect(parseOptions(["--version"])).toBe("version");
+  expect(parseOptions(["-v"])).toBe("version");
 });
 
 test("invalid arguments", () => {
